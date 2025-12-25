@@ -28,7 +28,7 @@ tokens_dict = dict((
     # General tokens
     ('NAME', r'[a-zA-Z_][a-zA-Z0-9_]*'),
     ('NUMBER', r'((\d+\.?\d*)|(\.\d+))(e[\+\-]*\d+)*'),
-    ('STRING', r'(".*?")|((?<=\W)\'.*?\')|(^\'.*?\')'),   # need to avoid single quote being used as transpose
+    ('STRING', r'("(.|\s)*?")|((?<=\W)\'(.|\s)*?\')|(^\'(.|\s)*?\')'),   # need to avoid single quote being used as transpose
     ('ignore_COMMENT', r'(%{(.|\s)*?%})|(%.*?\n)'),
     ('NEWLINE', r'\n'),
 

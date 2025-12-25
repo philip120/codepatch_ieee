@@ -41,6 +41,8 @@ def reconstruct_code_from_ast(node):
             op = node_type.split('"')[1] if '"' in node_type else node_type.split(' ')[1]
             if "unary" in node_type:
                 return f"{op}{reconstructed_children[0]}"
+            if op in ("'", ".'"):
+                return f"{reconstructed_children[0]}{op}"
             return f"{reconstructed_children[0]} {op} {reconstructed_children[1]}"
         elif node_type == 'assign':
             return f"{reconstructed_children[0]} = {reconstructed_children[1]}"
@@ -56,6 +58,20 @@ def reconstruct_code_from_ast(node):
             return "\n".join(reconstructed_children)
         elif node_type in ['expr', 'bracket']:
             return f"({reconstructed_children[0]})" if node_type == 'bracket' else reconstructed_children[0]
+        elif node_type == 'range ': # Note space in parser definition
+             return f"{reconstructed_children[0]}:{reconstructed_children[1]}"
+        elif node_type == 'dot':
+             return f"{reconstructed_children[0]}.{reconstructed_children[1]}"
+        elif node_type in ('matrx', 'cell_array'):
+             open_b, close_b = ('[', ']') if node_type == 'matrx' else ('{', '}')
+             content = reconstructed_children[0] if reconstructed_children else ""
+             return f"{open_b}{content}{close_b}"
+        elif node_type == 'matrx_rows':
+             return "; ".join(reconstructed_children)
+        elif node_type == 'matrx_elements':
+             return " ".join(reconstructed_children)
+        elif node_type == 'anonym_func':
+             return f"@{reconstructed_children[0]} {reconstructed_children[1]}"
 
     # Base case for terminals like variable names or numbers
     elif isinstance(node, (str, int, float)):
@@ -101,4 +117,4 @@ def get_semantic_patches(matlab_code: str, parser: Parser, lexer: Lexer) -> list
         if not patches:
             return [matlab_code]
             
-        return patches 
+        return patches

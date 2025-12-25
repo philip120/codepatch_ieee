@@ -1,48 +1,78 @@
-import re
+from matlab_lexer import MatlabLexer
 
-def split_top_level_blocks(code: str):
+def split_top_level_blocks(code: str) -> list[str]:
     """
     Splits MATLAB code into top-level blocks:
-    - function ... end
-    - remaining script code
+    - function ... end (or implicit end)
+    - top-level script code
+    
+    Uses the lexer to correctly track block depth and handles implicit function endings
+    based on indentation (sibling functions).
     """
-    lines = code.splitlines(keepends=True)
+    if not code.strip():
+        return []
+        
+    lexer = MatlabLexer()
+    padded_code = code + '\n'
+    tokens = list(lexer.tokenize(code)) 
+    
     blocks = []
-
-    current = []
+    
+    last_split = 0
     depth = 0
     in_function = False
-
-    for line in lines:
-        stripped = line.strip()
-
-        # function start (only at top level)
-        if stripped.startswith("function") and depth == 0:
-            if current:
-                blocks.append("".join(current))
-                current = []
-            in_function = True
-            depth = 1
-            current.append(line)
-            continue
-
-        if in_function:
-            current.append(line)
-
-            if re.match(r'^\s*function\b', stripped):
-                depth += 1
-            elif re.match(r'^\s*end\b', stripped):
+    function_start_col = -1
+    
+    block_openers = {'IF', 'FOR', 'WHILE', 'SWITCH', 'TRY'}
+    
+    for token in tokens:
+        if token.type == 'FUNCTION':
+            # Calculate column
+            line_start = padded_code.rfind('\n', 0, token.index) + 1
+            col = token.index - line_start
+            
+            # Heuristic: If we are in a function, and we see another 'function' keyword
+            # at the same or lower indentation level, assume the previous function implicitly ended.
+            if in_function and col <= function_start_col:
+                # Implicit close of previous function
+                blocks.append(padded_code[last_split : line_start])
+                last_split = line_start
+                depth = 0
+                in_function = False
+            
+            if depth == 0:
+                # Top level function start
+                # Flush preceding script/whitespace if any
+                if line_start > last_split:
+                    text = padded_code[last_split : line_start]
+                    if text.strip():
+                        blocks.append(text)
+                
+                # Start recording this function block
+                # We start at line_start to capture indentation
+                last_split = line_start
+                in_function = True
+                function_start_col = col
+            
+            depth += 1
+            
+        elif token.type in block_openers:
+            depth += 1
+            
+        elif token.type == 'END':
+            if depth > 0:
                 depth -= 1
-                if depth == 0:
-                    blocks.append("".join(current))
-                    current = []
+                if depth == 0 and in_function:
+                    # End of top-level function found explicitly
+                    end_pos = token.index + len(token.value)
+                    blocks.append(padded_code[last_split : end_pos])
+                    last_split = end_pos
                     in_function = False
-            continue
-
-        # outside functions
-        current.append(line)
-
-    if current:
-        blocks.append("".join(current))
-
-    return [b for b in blocks if b.strip()]
+    
+    # Flush remainder
+    if last_split < len(padded_code):
+        text = padded_code[last_split:]
+        if text.strip():
+            blocks.append(text)
+            
+    return blocks

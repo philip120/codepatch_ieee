@@ -43,7 +43,15 @@ class MatlabParser(sly.Parser):
     # -------------- dealing with reserved keywords -------------
     @_('FUNCTION statement code_block END NEWLINE')
     def statement(self, p):
-        return ('func_def', (('function', p[1][1]),
+        # Unwrap statement payload (p[1][1][0])
+        return ('func_def', (('function', p[1][1][0]),
+                             ('body', p[2][1]),
+                             ))
+
+    @_('FUNCTION statement code_block')
+    def statement(self, p):
+        # Unwrap statement payload (p[1][1][0])
+        return ('func_def', (('function', p[1][1][0]),
                              ('body', p[2][1]),
                              ))
 
@@ -55,13 +63,17 @@ class MatlabParser(sly.Parser):
     @_('FOR statement code_block END NEWLINE',
        'FOR statement code_block END SEMICOLON')
     def statement(self, p):
-        return ('for_loop', (('for', p[1][1]),
+        return ('for_loop', (('for', p[1][1][0]),
                              ('body', p[2][1]),
                              ))
 
     @_('CONTINUE NEWLINE', 'BREAK NEWLINE', 'CONTINUE SEMICOLON', 'BREAK SEMICOLON')
     def statement(self, p):
         return (p[0],)
+
+    @_('if_block END')
+    def statement(self, p):
+        return p[0]
 
     @_('if_block END NEWLINE', 'if_block END SEMICOLON')
     def statement(self, p):
@@ -79,26 +91,70 @@ class MatlabParser(sly.Parser):
 
     @_('if_block ELSEIF statement code_block')
     def if_block(self, p):
-        return ('if_block', p[0][1] + (('elseif', p[2][1]),
+        return ('if_block', p[0][1] + (('elseif', p[2][1][0]),
                                        ('body', p[3][1]),
                                        ))
 
+    @_('if_block ELSEIF expr code_block')
+    def if_block(self, p):
+        return ('if_block', p[0][1] + (('elseif', p[2]),
+                                       ('body', p[3][1]),
+                                       ))
+
+    # IF statement (delimited)
+    @_('IF statement statement END')
+    def statement(self, p):
+         return ('if_block', (('if', p[1][1][0]),
+                              ('body', (p[2],))
+                              ))
+
+    @_('IF statement statement END NEWLINE', 'IF statement statement END SEMICOLON')
+    def statement(self, p):
+         return ('if_block', (('if', p[1][1][0]),
+                              ('body', (p[2],))
+                              ))
+
     @_('IF statement code_block')
     def if_block(self, p):
-        return ('if_block', (('if', p[1][1]),
+        return ('if_block', (('if', p[1][1][0]),
+                             ('body', p[2][1]),
+                             ))
+
+    # IF expr (non-delimited)
+    @_('IF expr statement END')
+    def statement(self, p):
+         return ('if_block', (('if', p[1]),
+                              ('body', (p[2],))
+                              ))
+
+    @_('IF expr statement END NEWLINE', 'IF expr statement END SEMICOLON')
+    def statement(self, p):
+         return ('if_block', (('if', p[1]),
+                              ('body', (p[2],))
+                              ))
+
+    @_('IF expr code_block')
+    def if_block(self, p):
+        return ('if_block', (('if', p[1]),
                              ('body', p[2][1]),
                              ))
 
     @_('WHILE statement code_block END NEWLINE')
     def statement(self, p):
-        return ('while', (('while', p[1][1]),
+        return ('while', (('while', p[1][1][0]),
+                          ('body', p[2][1]),
+                          ))
+    
+    @_('WHILE expr code_block END NEWLINE')
+    def statement(self, p):
+        return ('while', (('while', p[1]),
                           ('body', p[2][1]),
                           ))
 
     @_('TRY code_block CATCH statement code_block END NEWLINE')
     def statement(self, p):
         return ('try_catch', (('try', p[1][1]),
-                              ('catch', p[3][1]),
+                              ('catch', p[3][1][0]),
                               ('body', p[4][1]),
                               ))
 
@@ -117,14 +173,41 @@ class MatlabParser(sly.Parser):
 
     @_('switch_block CASE statement code_block')
     def switch_block(self, p):
-        return ('switch_block', p[0][1] + (('case', p[2][1]),
+        return ('switch_block', p[0][1] + (('case', p[2][1][0]),
+                                           ('body', p[3][1]),
+                                           ))
+
+    @_('switch_block CASE expr code_block')
+    def switch_block(self, p):
+        return ('switch_block', p[0][1] + (('case', p[2]),
                                            ('body', p[3][1]),
                                            ))
 
     @_('SWITCH statement CASE statement code_block')
     def switch_block(self, p):
-        return ('switch_block', (('switch', p[1][1]),
-                                 ('case', p[3][1]),
+        return ('switch_block', (('switch', p[1][1][0]),
+                                 ('case', p[3][1][0]),
+                                 ('body', p[4][1]),
+                                 ))
+
+    @_('SWITCH statement CASE expr code_block')
+    def switch_block(self, p):
+        return ('switch_block', (('switch', p[1][1][0]),
+                                 ('case', p[3]),
+                                 ('body', p[4][1]),
+                                 ))
+
+    @_('SWITCH expr CASE statement code_block')
+    def switch_block(self, p):
+        return ('switch_block', (('switch', p[1]),
+                                 ('case', p[3][1][0]),
+                                 ('body', p[4][1]),
+                                 ))
+
+    @_('SWITCH expr CASE expr code_block')
+    def switch_block(self, p):
+        return ('switch_block', (('switch', p[1]),
+                                 ('case', p[3]),
                                  ('body', p[4][1]),
                                  ))
 
@@ -139,6 +222,10 @@ class MatlabParser(sly.Parser):
 
     @_('expr NEWLINE')                              # a newline without semicolon tells Matlab to display the results
     def statement(self, p):                         # (will distinguish this in later versions)
+        return ('statement', (p[0],))
+
+    @_('expr COMMA')                                # comma separator e.g. if x < 1, y = 2; end
+    def statement(self, p):
         return ('statement', (p[0],))
 
     @_('COMMAND')                                   # e.g. clear var1 var2
@@ -176,6 +263,10 @@ class MatlabParser(sly.Parser):
     def expr(self, p):
         return ('cell_array', (p[1],))
 
+    @_('LCURL RCURL')                               # e.g. {}
+    def expr(self, p):
+        return ('cell_array', ())
+
     @_('LCURL matrx_elements RCURL')                # e.g. {3 5 a 2^3} (no semicolon in the last row)
     def expr(self, p):
         return ('cell_array', (p[1],))
@@ -193,6 +284,10 @@ class MatlabParser(sly.Parser):
     @_('LSQR matrx_rows RSQR')                      # e.g. [3 5 a 2^3; 3 5 a 2^3;]
     def expr(self, p):
         return ('matrx', (p[1],))
+
+    @_('LSQR RSQR')                                 # e.g. []
+    def expr(self, p):
+        return ('matrx', ())
 
     @_('LSQR matrx_elements RSQR')                  # e.g. [3 5 a 2^3] (no semicolon in the last row)
     def expr(self, p):
@@ -216,13 +311,13 @@ class MatlabParser(sly.Parser):
     def matrx_rows(self, p):
         return ('matrx_rows', (p[0],))
 
-    @_('matrx_elements matrx_elements')             # e.g. 3 5 a 2^3
+    @_('matrx_elements expr')
     def matrx_elements(self, p):
-        return ('matrx_elements', p[0][1] + p[1][1])
+        return ('matrx_elements', p[0][1] + (p[1],))
 
-    @_('matrx_elements COMMA matrx_elements')       # e.g. 3, 5, a, 2^3  (COMMA makes no difference than space)
+    @_('matrx_elements COMMA expr')
     def matrx_elements(self, p):
-        return ('matrx_elements', p[0][1] + p[2][1])
+        return ('matrx_elements', p[0][1] + (p[2],))
 
     @_('expr')                                      # any expression could be elevated to matrx_elements
     def matrx_elements(self, p):
