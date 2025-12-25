@@ -1,7 +1,8 @@
 # train/semantic_adapter.py
-from semantic_extractor import extract_semantic_nodes
-from matlab_lexer import MatlabLexer
-from matlab_parser import MatlabParser
+from ast.semantic_extractor import extract_semantic_nodes
+from ast.matlab_lexer import MatlabLexer
+from ast.matlab_parser import MatlabParser
+
 
 lexer = MatlabLexer()
 parser = MatlabParser()
