@@ -1,6 +1,6 @@
-from ast_parser.semantic_nodes import SemanticNode, extract_flat_semantic_nodes
-from ast_parser.block_splitter import split_top_level_blocks
-from ast_parser.ast_utils import suppress_stderr
+from semantic_nodes import SemanticNode, extract_flat_semantic_nodes
+from block_splitter import split_top_level_blocks
+from ast_utils import suppress_stderr
 
 def weak_line_fallback(block: str):
     """
@@ -42,7 +42,7 @@ def weak_line_fallback(block: str):
 
 
 def extract_semantic_nodes(code: str, parser, lexer):
-    from ast_parser.block_splitter import split_top_level_blocks
+    from block_splitter import split_top_level_blocks
 
     nodes = []
     next_id = 0
