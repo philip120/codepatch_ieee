@@ -117,3 +117,23 @@ class ProjectionMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
+
+
+# --- Loss Functions ---
+def cosine_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """
+    Cosine similarity loss: 1 - cos_sim(pred, target)
+    Returns 0 when vectors are identical, 2 when opposite.
+    """
+    cos_sim = nn.functional.cosine_similarity(pred.unsqueeze(0), target.unsqueeze(0))
+    return 1 - cos_sim.mean()
+
+
+def combined_loss(pred: torch.Tensor, target: torch.Tensor, alpha: float = 0.5) -> torch.Tensor:
+    """
+    Combined MSE + Cosine loss.
+    alpha: weight for cosine loss (1-alpha for MSE)
+    """
+    mse = nn.functional.mse_loss(pred, target)
+    cos = cosine_loss(pred, target)
+    return alpha * cos + (1 - alpha) * mse
