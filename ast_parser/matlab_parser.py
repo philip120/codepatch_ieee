@@ -1,6 +1,6 @@
 import sys
 import sly
-from matlab_lexer import MatlabLexer
+from ast_parser.matlab_lexer import MatlabLexer
 
 class MatlabParser(sly.Parser):
 

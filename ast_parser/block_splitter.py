@@ -1,4 +1,4 @@
-from matlab_lexer import MatlabLexer
+from ast_parser.matlab_lexer import MatlabLexer
 
 def split_top_level_blocks(code: str) -> list[str]:
     """

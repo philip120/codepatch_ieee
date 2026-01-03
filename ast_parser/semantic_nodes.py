@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from ast_utils import reconstruct_code_from_ast
+from ast_parser.ast_utils import reconstruct_code_from_ast
 
 @dataclass
 class SemanticNode:
