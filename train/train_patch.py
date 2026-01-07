@@ -141,7 +141,7 @@ class PatchModel(nn.Module):
         """
         # 1. Pad nodes to multiple of patch_size
         # Clip to max length first to avoid OOM
-        nodes = nodes[:self.max_nodes]
+        nodes = list(nodes)[:self.max_nodes]
         current_len = len(nodes)
         
         # Calculate padding needed
