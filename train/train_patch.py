@@ -174,7 +174,7 @@ class PatchModel(nn.Module):
         # 3. Reshape into patches [num_patches, patch_size * 768]
         # view() effectively "concatenates" the vectors of the patch into one long row
         num_patches = len(padded_nodes) // self.patch_size
-        patches = node_embeds.view(num_patches, self.patch_size * 768)
+        patches = node_embeds.reshape(num_patches, self.patch_size * 768)
         
         return patches
 
