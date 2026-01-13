@@ -24,33 +24,17 @@ from model.projector import Projector
 from model.qwen_decoder import QwenDecoder
 
 from train.load_dataset import load_matlab_nl_dataset
+from train.matlab_dataset import MatlabPseudocodeDataset
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 
 
 # ==============================================================================
 # DATASET
 # ==============================================================================
 
-class MatlabPseudocodeDataset(Dataset):
-    """
-    Dataset wrapper for Hugging Face philip120/matlab-nl-pseudocode
-    """
-
-    def __init__(self, split: str = "train"):
-        print(f"Loading dataset from Hugging Face (split={split})...")
-        self.data = load_matlab_nl_dataset(split)
-        print(f"Loaded {len(self.data)} samples")
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        sample = self.data[idx]
-        return {
-            'code': sample['code'],
-            'target': sample['nl'],
-        }
+# Dataset class moved to train/matlab_dataset.py
 
 
 # ==============================================================================
@@ -111,20 +95,22 @@ class SemanticViT(nn.Module):
     def num_trainable_parameters(self):
         return sum(p.numel() for p in self.get_trainable_parameters())
 
-    def forward(self, code: str, target: str = None):
+    def forward(self, code: str, target: str = None, features: dict = None):
         """
         Forward pass.
 
         Args:
             code: MATLAB source code
             target: Target pseudocode (for training)
+            features: Pre-computed semantic features (optional)
 
         Returns:
             If target provided: loss
             If no target: projected embeddings
         """
         # Step 1: Extract semantic features
-        features = self.extractor(code)
+        if features is None:
+            features = self.extractor(code)
 
         if not features['texts']:
             # Empty code, return dummy loss
@@ -205,7 +191,8 @@ def train(
     print("\n" + "=" * 60)
     print("Loading dataset from Hugging Face...")
     dataset = MatlabPseudocodeDataset(split=split)
-    loader = DataLoader(dataset, batch_size=1, shuffle=True)
+    # Use collate_fn to return single sample dict directly (batch_size=1)
+    loader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=lambda x: x[0])
 
     if len(dataset) == 0:
         print("ERROR: No samples found!")
@@ -259,11 +246,12 @@ def train(
         epoch_samples = 0
 
         for batch_idx, batch in enumerate(loader):
-            code = batch['code'][0]
-            target = batch['target'][0]
+            code = batch['code']
+            target = batch['target']
+            features = batch.get('features')
 
             # Forward pass
-            loss = model(code, target)
+            loss = model(code, target=target, features=features)
 
             if loss is None or loss.item() == 0:
                 continue
