@@ -14,6 +14,8 @@ import torch
 from model.semantic_extractor import SemanticExtractor, ID_TO_TYPE, MAX_DEPTH, NUM_TYPES
 from model.codebert_encoder import CodeBERTEncoder
 from model.pixel_embedder import PixelEmbedder
+from model.patch_embedder import PatchEmbedder
+from model.projector import Projector
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -85,9 +87,56 @@ if __name__ == "__main__":
     print(f"  = pixel_emb [N, 768]: {pixel_embeddings.shape}")
     print(f"\n  Trainable params: {embedder.num_parameters():,}")
 
+    # ===================== STEP 4 =====================
+    print("\n" + "=" * 60)
+    print("STEP 4: PATCH EMBEDDINGS (group pixels)")
+    print("=" * 60)
+
+    PATCH_SIZE = 4
+    patcher = PatchEmbedder(patch_size=PATCH_SIZE)
+
+    patch_embeddings = patcher(pixel_embeddings)
+
+    num_pixels = pixel_embeddings.shape[0]
+    num_patches = patch_embeddings.shape[0]
+    flat_dim = patch_embeddings.shape[1]
+
+    print(f"\n  patch_size = {PATCH_SIZE}")
+    print(f"\n  Input:  {num_pixels} pixels  [{num_pixels}, 768]")
+    print(f"  Output: {num_patches} patches [{num_patches}, {flat_dim}]")
+    print(f"\n  Visualization:")
+    print(f"    pixels:  [p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, PAD, PAD]")
+    print(f"              \_________/  \_________/  \______________/")
+    print(f"    patches:   patch 0      patch 1        patch 2")
+    print(f"\n  Each patch: {PATCH_SIZE} pixels × 768 = {flat_dim} dim")
+
+    # ===================== STEP 5 =====================
+    print("\n" + "=" * 60)
+    print("STEP 5: PROJECTOR (Bottleneck MLP)")
+    print("=" * 60)
+
+    BOTTLENECK = 512
+    QWEN_DIM = 1536
+    DROPOUT = 0.4
+
+    projector = Projector(
+        in_dim=flat_dim,
+        bottleneck_dim=BOTTLENECK,
+        out_dim=QWEN_DIM,
+        dropout=DROPOUT
+    ).to(DEVICE)
+
+    projected = projector(patch_embeddings)
+
+    print(f"\n  Architecture: {flat_dim} → {BOTTLENECK} → {QWEN_DIM}")
+    print(f"  Dropout: {DROPOUT}")
+    print(f"\n  Input:  {patch_embeddings.shape}")
+    print(f"  Output: {projected.shape}")
+    print(f"\n  Trainable params: {projector.num_parameters():,}")
+
     # ===================== SUMMARY =====================
     print("\n" + "=" * 60)
-    print("SUMMARY SO FAR")
+    print("SUMMARY - FULL PIPELINE")
     print("=" * 60)
     print(f"""
   MATLAB code
@@ -98,19 +147,21 @@ if __name__ == "__main__":
       ▼ CodeBERTEncoder (Step 2, frozen)
   cls_embeddings: {cls_embeddings.shape}
       │
-      ▼ PixelEmbedder (Step 3, trainable)
+      ▼ PixelEmbedder (Step 3, trainable: {embedder.num_parameters():,} params)
   pixel_embeddings: {pixel_embeddings.shape}
       │
-      ▼ PatchEmbedder (Step 4, TODO)
-  patch_embeddings: [N/P, P*768]
+      ▼ PatchEmbedder (Step 4, patch_size={PATCH_SIZE})
+  patch_embeddings: {patch_embeddings.shape}
       │
-      ▼ Projector (Step 5, TODO)
-  projected: [N/P, 1536]
+      ▼ Projector (Step 5, trainable: {projector.num_parameters():,} params)
+  projected: {projected.shape}
       │
-      ▼ Qwen (Step 6, TODO)
+      ▼ Qwen (Step 6, frozen, TODO)
   output text
+
+  TOTAL TRAINABLE: {embedder.num_parameters() + projector.num_parameters():,} params
     """)
 
     print("=" * 60)
-    print("Ready for STEP 4: Patching")
+    print("Ready for STEP 6: Qwen Integration")
     print("=" * 60)

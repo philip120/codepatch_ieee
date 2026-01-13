@@ -27,3 +27,5 @@ Structure:
 from .semantic_extractor import SemanticExtractor, TYPE_TO_ID, NUM_TYPES, MAX_DEPTH
 from .codebert_encoder import CodeBERTEncoder
 from .pixel_embedder import PixelEmbedder
+from .patch_embedder import PatchEmbedder
+from .projector import Projector
