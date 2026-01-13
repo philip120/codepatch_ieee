@@ -16,6 +16,7 @@ from model.codebert_encoder import CodeBERTEncoder
 from model.pixel_embedder import PixelEmbedder
 from model.patch_embedder import PatchEmbedder
 from model.projector import Projector
+from model.qwen_decoder import QwenDecoder
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -162,6 +163,59 @@ if __name__ == "__main__":
   TOTAL TRAINABLE: {embedder.num_parameters() + projector.num_parameters():,} params
     """)
 
+    # ===================== STEP 6 =====================
     print("=" * 60)
-    print("Ready for STEP 6: Qwen Integration")
+    print("STEP 6: QWEN DECODER")
+    print("=" * 60)
+
+    decoder = QwenDecoder(device=DEVICE)
+
+    # Test training forward pass
+    target_text = "This function tests if x is positive and doubles it, otherwise sets y to zero."
+
+    print(f"\n  Target text: \"{target_text[:50]}...\"")
+    print(f"  Projected shape: {projected.shape}")
+
+    loss = decoder.forward_train(projected, target_text)
+    print(f"\n  Training loss: {loss.item():.4f}")
+
+    # Test generation
+    print("\n  Generating from embeddings...")
+    generated = decoder.generate(projected, max_new_tokens=32)
+    print(f"  Generated: \"{generated[:100]}...\"")
+
+    # ===================== FINAL SUMMARY =====================
+    print("\n" + "=" * 60)
+    print("COMPLETE PIPELINE")
+    print("=" * 60)
+    print(f"""
+  MATLAB code
+      │
+      ▼ SemanticExtractor (Step 1)
+  {len(features['texts'])} pixels
+      │
+      ▼ CodeBERTEncoder (Step 2, FROZEN)
+  {cls_embeddings.shape}
+      │
+      ▼ PixelEmbedder (Step 3, TRAINABLE: {embedder.num_parameters():,})
+  {pixel_embeddings.shape}
+      │
+      ▼ PatchEmbedder (Step 4, patch_size={PATCH_SIZE})
+  {patch_embeddings.shape}
+      │
+      ▼ Projector (Step 5, TRAINABLE: {projector.num_parameters():,})
+  {projected.shape}
+      │
+      ▼ QwenDecoder (Step 6, FROZEN)
+  → loss: {loss.item():.4f}
+  → text: "{generated[:50]}..."
+
+  ════════════════════════════════════════════════════════
+  TRAINABLE PARAMS: {embedder.num_parameters() + projector.num_parameters():,}
+  FROZEN PARAMS:    CodeBERT (~125M) + Qwen (~1.5B)
+  ════════════════════════════════════════════════════════
+    """)
+
+    print("=" * 60)
+    print("ALL STEPS COMPLETE! Ready for training loop.")
     print("=" * 60)

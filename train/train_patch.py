@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
 
 from train.load_dataset import load_matlab_nl_dataset
-from train.semantic_adapter import code_to_nodes
+from train.semantic_adapter import code_to_nodes, code_to_nodes_with_depth
 from train.dataset import CodeNLDataset
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -71,19 +71,21 @@ class PatchProjector(nn.Module):
 
 class PatchModel(nn.Module):
     """
-    End-to-End Patch-Based Model.
-    
+    End-to-End Patch-Based Model with Tree Depth Position Encoding.
+
     Architecture:
     1. Code Nodes -> CodeBERT -> [N, 768]
-    2. Grouping -> Patches of size P -> [N/P, P*768]
-    3. PatchProjector -> [N/P, 1536]
-    4. Qwen LLM -> Generates Pseudocode from these patch embeddings
+    2. Add Depth Embeddings (tree structure position encoding)
+    3. Grouping -> Patches of size P -> [N/P, P*768]
+    4. PatchProjector -> [N/P, 1536]
+    5. Qwen LLM -> Generates Pseudocode from these patch embeddings
     """
-    def __init__(self, patch_size: int = 4, max_nodes: int = 64):
+    def __init__(self, patch_size: int = 4, max_nodes: int = 64, max_depth: int = 16):
         super().__init__()
         self.patch_size = patch_size
         self.max_nodes = max_nodes
-        
+        self.max_depth = max_depth
+
         # Ensure max_nodes is divisible by patch_size for simplicity.
         # This guarantees we always have full patches (after padding).
         if self.max_nodes % self.patch_size != 0:
@@ -95,17 +97,22 @@ class PatchModel(nn.Module):
         print("Loading CodeBERT...")
         self.codebert_tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
         self.codebert = AutoModel.from_pretrained("microsoft/codebert-base")
-        
+
         for param in self.codebert.parameters():
             param.requires_grad = False
         self.codebert.eval()
 
-        # --- 2. Projector (Trainable) ---
-        # This is the ONLY part of the model that learns.
-        # It learns to map CodeBERT patches -> Qwen tokens.
+        # --- 2. Depth Embedding (Trainable) ---
+        # Tree depth serves as position encoding - similar to ViT's position embeddings
+        # but encoding AST structure instead of spatial position.
+        # This is added to each node embedding before patching.
+        self.depth_embedding = nn.Embedding(max_depth, 768)
+
+        # --- 3. Projector (Trainable) ---
+        # Learns to map CodeBERT patches (with depth info) -> Qwen tokens.
         self.projector = PatchProjector(
-            patch_size=patch_size, 
-            in_dim=768, 
+            patch_size=patch_size,
+            in_dim=768,
             out_dim=1536
         )
 
@@ -127,15 +134,21 @@ class PatchModel(nn.Module):
             param.requires_grad = False
         self.qwen.eval()
 
-    def embed_nodes(self, nodes: list[str]) -> torch.Tensor:
+    def embed_nodes(self, nodes: list[str], depths: list[int] = None) -> torch.Tensor:
         """
-        Embeds nodes and groups them into patches.
-        
+        Embeds nodes with depth position encoding and groups them into patches.
+
         Process:
         1. Pad the list of nodes so its length is a multiple of patch_size.
         2. Run CodeBERT on all nodes to get [N_padded, 768].
-        3. Reshape/View the tensor to group vectors into patches.
-        
+        3. Add depth embeddings to each node (tree structure position encoding).
+        4. Reshape/View the tensor to group vectors into patches.
+
+        Args:
+            nodes: List of semantic operation strings (e.g., "if x > 0")
+            depths: List of tree depths for each node (e.g., [0, 1, 1, 2])
+                    If None, defaults to all zeros.
+
         Returns: [num_patches, patch_size * 768]
                  This is a list of "flattened patches" ready for the MLP.
         """
@@ -143,7 +156,13 @@ class PatchModel(nn.Module):
         # Clip to max length first to avoid OOM
         nodes = list(nodes)[:self.max_nodes]
         current_len = len(nodes)
-        
+
+        # Handle depths
+        if depths is None:
+            depths = [0] * current_len
+        else:
+            depths = list(depths)[:self.max_nodes]
+
         # Calculate padding needed
         # e.g. if len=10 and patch=4, we need 2 more to get to 12.
         remainder = current_len % self.patch_size
@@ -152,10 +171,14 @@ class PatchModel(nn.Module):
             pad_len = self.patch_size - remainder
         elif current_len == 0:
             pad_len = self.patch_size
-            
+
         # Add empty strings as padding (CodeBERT will embed these as something neutral/CLS)
         padded_nodes = nodes + [""] * pad_len
-        
+        padded_depths = depths + [0] * pad_len  # Pad depths with 0
+
+        # Clamp depths to max_depth
+        padded_depths = [min(d, self.max_depth - 1) for d in padded_depths]
+
         # 2. Embed all nodes individually with CodeBERT
         # We process in batches via the tokenizer for speed
         inputs = self.codebert_tokenizer(
@@ -165,31 +188,37 @@ class PatchModel(nn.Module):
             truncation=True,
             max_length=64
         ).to(DEVICE)
-        
+
         with torch.no_grad():
             outputs = self.codebert(**inputs)
             # Use CLS token [N, 768] as the node representation
             node_embeds = outputs.last_hidden_state[:, 0, :]
-            
-        # 3. Reshape into patches [num_patches, patch_size * 768]
+
+        # 3. Add depth embeddings (tree structure position encoding)
+        # This is the key difference from standard transformers - we encode AST depth
+        depth_tensor = torch.tensor(padded_depths, device=DEVICE)
+        depth_embeds = self.depth_embedding(depth_tensor)  # [N, 768]
+        node_embeds = node_embeds + depth_embeds  # Add depth info to each node
+
+        # 4. Reshape into patches [num_patches, patch_size * 768]
         # view() effectively "concatenates" the vectors of the patch into one long row
         num_patches = len(padded_nodes) // self.patch_size
         patches = node_embeds.reshape(num_patches, self.patch_size * 768)
-        
+
         return patches
 
-    def forward(self, nodes: list[str], target_text: str):
+    def forward(self, nodes: list[str], target_text: str, depths: list[int] = None):
         """
         Forward pass for Training.
-        
-        1. Convert Nodes -> Patch Embeddings (via Projector)
+
+        1. Convert Nodes -> Patch Embeddings (via Projector) with depth encoding
         2. Convert Target Text -> Target Embeddings (via Qwen)
         3. Concatenate: [Patch Embeddings] + [Target Embeddings]
         4. Feed to Qwen to calculate "Next Token Prediction" loss.
         """
         # 1. Get patch embeddings [num_patches, input_dim]
-        # This runs CodeBERT (frozen)
-        patch_inputs = self.embed_nodes(nodes)
+        # This runs CodeBERT (frozen) + adds depth embeddings
+        patch_inputs = self.embed_nodes(nodes, depths)
         
         # 2. Project patches [num_patches, 1536]
         # This runs the MLP (Trainable) - gradients start here
@@ -240,15 +269,15 @@ class PatchModel(nn.Module):
         return outputs.loss
 
     @torch.no_grad()
-    def generate(self, nodes: list[str], max_new_tokens: int = 128) -> str:
+    def generate(self, nodes: list[str], depths: list[int] = None, max_new_tokens: int = 128) -> str:
         """
         Inference / Generation.
-        
-        1. Embed Nodes -> Patches -> Projected Vectors
+
+        1. Embed Nodes with depth encoding -> Patches -> Projected Vectors
         2. Feed Projected Vectors as the "Prompt" to Qwen
         3. Auto-regressively generate the text
         """
-        patch_inputs = self.embed_nodes(nodes)
+        patch_inputs = self.embed_nodes(nodes, depths)
         projected = self.projector(patch_inputs)
         projected = projected.unsqueeze(0).to(self.qwen.dtype)
         
