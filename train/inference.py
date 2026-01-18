@@ -1,8 +1,11 @@
 # train/inference.py
 """
-Code-to-Thought Inference Pipeline
+Semantic ViT Inference Pipeline
 
-Takes MATLAB code → Semantic Nodes → CodeBERT → MLP Projection → Qwen → Pseudocode
+Usage:
+    python -m train.inference --checkpoint checkpoints/best_model.pt --eval
+    python -m train.inference --checkpoint checkpoints/best_model.pt --code "function y = test(x) ..."
+    python -m train.inference --checkpoint checkpoints/best_model.pt --interactive
 """
 import sys
 import os
@@ -10,231 +13,243 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+import argparse
+from pathlib import Path
 
-from train.semantic_adapter import code_to_nodes
-from train.model import codebert_embed_nodes, ProjectionMLP
+from model.semantic_extractor import SemanticExtractor, MAX_DEPTH, NUM_TYPES
+from model.codebert_encoder import CodeBERTEncoder
+from model.pixel_embedder import PixelEmbedder
+from model.patch_embedder import PatchEmbedder
+from model.projector import Projector
+from model.qwen_decoder import QwenDecoder
+
+from train.load_dataset import load_matlab_nl_dataset
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Global model cache
-_qwen_tokenizer = None
-_qwen_model = None
-_mlp = None
 
-
-def load_models(checkpoint_path: str = "mlp_best.pt"):
-    """Load all models for inference."""
-    global _qwen_tokenizer, _qwen_model, _mlp
-
-    # Load MLP
-    if _mlp is None:
-        print("Loading projection MLP...")
-        _mlp = ProjectionMLP(in_dim=768, out_dim=1536).to(DEVICE)
-        checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
-        _mlp.load_state_dict(checkpoint['model_state_dict'])
-        _mlp.eval()
-
-    # Load Qwen for generation
-    if _qwen_model is None:
-        print("Loading Qwen2 (1.5B) for generation...")
-        model_name = "Qwen/Qwen2-1.5B"
-        _qwen_tokenizer = AutoTokenizer.from_pretrained(model_name)
-        _qwen_model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
-        )
-        _qwen_model.to(DEVICE)
-        _qwen_model.eval()
-
-    return _mlp, _qwen_tokenizer, _qwen_model
-
-
-def generate_pseudocode(
-    matlab_code: str,
-    checkpoint_path: str = "mlp_best.pt",
-    max_new_tokens: int = 256,
-    num_thought_tokens: int = 8,
-    temperature: float = 0.7,
-    show_nodes: bool = False,
-):
+class SemanticViTInference:
     """
-    Generate pseudocode from MATLAB code using the C2T pipeline.
-
-    Args:
-        matlab_code: Input MATLAB code
-        checkpoint_path: Path to trained MLP checkpoint
-        max_new_tokens: Maximum tokens to generate
-        num_thought_tokens: Number of "thought" embeddings to inject
-        temperature: Sampling temperature
-        show_nodes: Print extracted semantic nodes
-
-    Returns:
-        Generated pseudocode string
+    Inference wrapper for Semantic ViT.
     """
-    mlp, tokenizer, model = load_models(checkpoint_path)
 
-    # 1. Extract semantic nodes from MATLAB code
-    nodes = code_to_nodes(matlab_code)
-    if not nodes:
-        return "Error: Could not parse MATLAB code"
+    def __init__(
+        self,
+        checkpoint_path: str,
+        patch_size: int = 4,
+        bottleneck_dim: int = 512,
+    ):
+        print("=" * 60)
+        print("Loading Semantic ViT for Inference")
+        print("=" * 60)
 
-    if show_nodes:
-        print(f"\nExtracted {len(nodes)} semantic nodes:")
-        for i, n in enumerate(nodes):
-            print(f"  [{i}] {n}")
-        print()
+        self.patch_size = patch_size
 
-    # 2. Embed code nodes with CodeBERT
-    with torch.no_grad():
-        z_code = codebert_embed_nodes(nodes)  # [768]
+        # Step 1: Semantic extraction
+        self.extractor = SemanticExtractor()
 
-        # 3. Project to Qwen space with MLP
-        z_thought = mlp(z_code)  # [1536]
+        # Step 2: CodeBERT (frozen)
+        self.encoder = CodeBERTEncoder(device=DEVICE)
 
-        # 4. Expand to multiple "thought tokens"
-        # Repeat the thought embedding to create a sequence of thought tokens
-        thought_embeds = z_thought.unsqueeze(0).unsqueeze(0)  # [1, 1, 1536]
-        thought_embeds = thought_embeds.expand(1, num_thought_tokens, -1)  # [1, num_thoughts, 1536]
+        # Step 3: Pixel embedder
+        self.pixel_embedder = PixelEmbedder(
+            max_depth=MAX_DEPTH,
+            num_types=NUM_TYPES,
+        ).to(DEVICE)
 
-        # 5. Create the text prompt
-        prompt = "Based on the code analysis above, here is a clear pseudocode description:\n"
+        # Step 4: Patch embedder
+        self.patch_embedder = PatchEmbedder(patch_size=patch_size)
 
-        # Tokenize prompt
-        prompt_tokens = tokenizer(prompt, return_tensors="pt").to(DEVICE)
-        prompt_embeds = model.get_input_embeddings()(prompt_tokens.input_ids)  # [1, seq, 1536]
+        # Step 5: Projector
+        self.projector = Projector(
+            in_dim=patch_size * 768,
+            bottleneck_dim=bottleneck_dim,
+            out_dim=1536,
+            dropout=0.0,  # No dropout during inference
+        ).to(DEVICE)
 
-        # 6. Concatenate: [thought_embeds] + [prompt_embeds]
-        # Convert thought_embeds to same dtype as prompt_embeds
-        thought_embeds = thought_embeds.to(prompt_embeds.dtype)
-        input_embeds = torch.cat([thought_embeds, prompt_embeds], dim=1)
+        # Step 6: Qwen decoder
+        self.decoder = QwenDecoder(device=DEVICE)
 
-        # 7. Generate with Qwen
-        # Create attention mask for the combined input
-        attn_mask = torch.ones(1, input_embeds.shape[1], device=DEVICE)
+        # Load checkpoint
+        print(f"\nLoading checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
 
-        outputs = model.generate(
-            inputs_embeds=input_embeds,
-            attention_mask=attn_mask,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            do_sample=True,
-            top_p=0.9,
-            pad_token_id=tokenizer.eos_token_id,
-        )
+        self.pixel_embedder.load_state_dict(checkpoint['pixel_embedder'])
 
-        # Decode output (skip the input length)
-        generated_ids = outputs[0]
-        pseudocode = tokenizer.decode(generated_ids, skip_special_tokens=True)
+        # Handle projector with dropout mismatch
+        projector_state = checkpoint['projector']
+        self.projector.load_state_dict(projector_state, strict=False)
 
-    return pseudocode
+        # Set to eval mode
+        self.pixel_embedder.eval()
+        self.projector.eval()
+
+        step = checkpoint.get('step', 'N/A')
+        loss = checkpoint.get('loss', 0)
+        print(f"Checkpoint loaded (step {step}, loss {loss:.4f})")
+        print("=" * 60)
+
+    @torch.no_grad()
+    def generate(self, code: str, max_new_tokens: int = 128, show_features: bool = False) -> str:
+        """
+        Generate pseudocode from MATLAB code.
+        """
+        # Step 1: Extract semantic features
+        features = self.extractor(code)
+
+        if not features['texts']:
+            return "[Empty code - no semantic operations found]"
+
+        if show_features:
+            print(f"\n  Extracted {len(features['texts'])} semantic operations:")
+            for i, (text, depth) in enumerate(zip(features['texts'], features['depths'])):
+                print(f"    [{i}] D{depth}: {text[:50]}")
+
+        # Step 2: CodeBERT embeddings
+        cls_embeddings = self.encoder(features['texts'])
+
+        # Step 3: Pixel embeddings
+        depth_ids = torch.tensor(features['depths'], device=DEVICE)
+        type_ids = torch.tensor(features['type_ids'], device=DEVICE)
+        pixel_embeddings = self.pixel_embedder(cls_embeddings, depth_ids, type_ids)
+
+        # Step 4: Patch embeddings
+        patch_embeddings = self.patch_embedder(pixel_embeddings)
+
+        # Step 5: Project to Qwen space
+        projected = self.projector(patch_embeddings)
+
+        # Step 6: Generate
+        return self.decoder.generate(projected, max_new_tokens=max_new_tokens)
 
 
-def batch_generate(
-    codes: list[str],
-    checkpoint_path: str = "mlp_best.pt",
-    **kwargs
-) -> list[str]:
-    """Generate pseudocode for multiple MATLAB code snippets."""
-    results = []
-    for i, code in enumerate(codes):
-        print(f"Processing {i+1}/{len(codes)}...")
-        result = generate_pseudocode(code, checkpoint_path, **kwargs)
-        results.append(result)
-    return results
-
-
-def interactive_mode(checkpoint_path: str = "mlp_best.pt"):
-    """Interactive pseudocode generation."""
+def evaluate_on_dataset(model: SemanticViTInference, split: str = "train", num_samples: int = 10):
+    """
+    Evaluate model on dataset samples.
+    """
+    print("\n" + "=" * 60)
+    print(f"Evaluating on {num_samples} samples from '{split}' split")
     print("=" * 60)
-    print("MATLAB to Pseudocode Generator (C2T Pipeline)")
-    print("=" * 60)
-    print("\nEnter MATLAB code (end with empty line), or 'quit' to exit.\n")
 
-    load_models(checkpoint_path)
+    data = load_matlab_nl_dataset(split)
+
+    for i, sample in enumerate(data[:num_samples]):
+        code = sample['code']
+        target = sample['nl']
+
+        print(f"\n{'─' * 60}")
+        print(f"Sample {i + 1}/{num_samples}")
+        print(f"{'─' * 60}")
+
+        # Truncate code for display
+        code_display = code[:300] + "..." if len(code) > 300 else code
+        print(f"\nCODE:\n{code_display}")
+
+        print(f"\nTARGET:\n{target}")
+
+        generated = model.generate(code, max_new_tokens=100)
+        print(f"\nGENERATED:\n{generated}")
+
+    print("\n" + "=" * 60)
+    print("Evaluation complete")
+    print("=" * 60)
+
+
+def interactive_mode(model: SemanticViTInference):
+    """
+    Interactive mode - enter code and get pseudocode.
+    """
+    print("\n" + "=" * 60)
+    print("Interactive Mode")
+    print("Enter MATLAB code (type 'END' on new line to finish, 'quit' to exit)")
+    print("=" * 60)
 
     while True:
-        print("-" * 40)
-        print("Enter MATLAB code:")
+        print("\nEnter MATLAB code:")
         lines = []
         while True:
             try:
                 line = input()
             except EOFError:
                 return
-            if line.lower() == "quit":
+            if line.strip().upper() == 'END':
+                break
+            if line.strip().lower() == 'quit':
                 print("Goodbye!")
                 return
-            if line == "":
-                break
             lines.append(line)
 
-        if not lines:
+        code = '\n'.join(lines)
+
+        if not code.strip():
             continue
 
-        matlab_code = "\n".join(lines)
-        print("\nGenerating pseudocode...")
-
-        pseudocode = generate_pseudocode(
-            matlab_code,
-            checkpoint_path=checkpoint_path,
-            show_nodes=True,
-            max_new_tokens=256,
-        )
-
-        print("\n" + "=" * 40)
+        print("\nGenerating...")
+        generated = model.generate(code, show_features=True)
+        print(f"\n{'=' * 40}")
         print("GENERATED PSEUDOCODE:")
         print("=" * 40)
-        print(pseudocode)
-        print()
+        print(generated)
 
 
 if __name__ == "__main__":
-    import argparse
+    parser = argparse.ArgumentParser(description="Semantic ViT Inference")
 
-    parser = argparse.ArgumentParser(description="Generate pseudocode from MATLAB code")
-    parser.add_argument("--checkpoint", type=str, default="mlp_best.pt")
-    parser.add_argument("--code", type=str, default=None, help="MATLAB code string")
-    parser.add_argument("--file", type=str, default=None, help="Path to MATLAB file")
-    parser.add_argument("--interactive", action="store_true", help="Interactive mode")
-    parser.add_argument("--max_tokens", type=int, default=256)
-    parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument("--thoughts", type=int, default=8, help="Number of thought tokens")
+    parser.add_argument("--checkpoint", type=str, required=True,
+                        help="Path to checkpoint file")
+    parser.add_argument("--code", type=str, default=None,
+                        help="MATLAB code to process (inline)")
+    parser.add_argument("--file", type=str, default=None,
+                        help="Path to MATLAB file to process")
+    parser.add_argument("--eval", action="store_true",
+                        help="Evaluate on dataset samples")
+    parser.add_argument("--split", type=str, default="train",
+                        help="Dataset split for evaluation")
+    parser.add_argument("--num_samples", type=int, default=10,
+                        help="Number of samples for evaluation")
+    parser.add_argument("--interactive", action="store_true",
+                        help="Interactive mode")
+    parser.add_argument("--patch_size", type=int, default=4)
+    parser.add_argument("--bottleneck", type=int, default=512)
+    parser.add_argument("--max_tokens", type=int, default=128)
+
     args = parser.parse_args()
 
-    if args.interactive:
-        interactive_mode(args.checkpoint)
-    elif args.file:
-        with open(args.file, "r") as f:
-            code = f.read()
-        print(f"Processing: {args.file}")
-        result = generate_pseudocode(
-            code,
-            checkpoint_path=args.checkpoint,
-            max_new_tokens=args.max_tokens,
-            temperature=args.temperature,
-            num_thought_tokens=args.thoughts,
-            show_nodes=True,
-        )
-        print("\n" + "=" * 40)
-        print("GENERATED PSEUDOCODE:")
-        print("=" * 40)
-        print(result)
+    # Load model
+    model = SemanticViTInference(
+        checkpoint_path=args.checkpoint,
+        patch_size=args.patch_size,
+        bottleneck_dim=args.bottleneck,
+    )
+
+    # Run mode
+    if args.eval:
+        evaluate_on_dataset(model, split=args.split, num_samples=args.num_samples)
+
     elif args.code:
-        result = generate_pseudocode(
-            args.code,
-            checkpoint_path=args.checkpoint,
-            max_new_tokens=args.max_tokens,
-            temperature=args.temperature,
-            num_thought_tokens=args.thoughts,
-            show_nodes=True,
-        )
-        print("\n" + "=" * 40)
-        print("GENERATED PSEUDOCODE:")
+        print("\nInput code:")
+        print(args.code)
+        generated = model.generate(args.code, max_new_tokens=args.max_tokens, show_features=True)
+        print(f"\n{'=' * 40}")
+        print("GENERATED:")
         print("=" * 40)
-        print(result)
+        print(generated)
+
+    elif args.file:
+        code = Path(args.file).read_text()
+        print(f"\nInput file: {args.file}")
+        generated = model.generate(code, max_new_tokens=args.max_tokens, show_features=True)
+        print(f"\n{'=' * 40}")
+        print("GENERATED:")
+        print("=" * 40)
+        print(generated)
+
+    elif args.interactive:
+        interactive_mode(model)
+
     else:
-        # Demo with example code
+        # Demo
         demo_code = """
 function y = calc(x)
     y = 0;
@@ -244,12 +259,9 @@ function y = calc(x)
 end
 """
         print("Demo: Generating pseudocode for sample function")
-        result = generate_pseudocode(
-            demo_code,
-            checkpoint_path=args.checkpoint,
-            show_nodes=True,
-        )
-        print("\n" + "=" * 40)
+        print(f"\nCode:\n{demo_code}")
+        generated = model.generate(demo_code, show_features=True)
+        print(f"\n{'=' * 40}")
         print("GENERATED PSEUDOCODE:")
         print("=" * 40)
-        print(result)
+        print(generated)

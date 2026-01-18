@@ -5,7 +5,17 @@ Semantic Adapter for MATLAB Code → Tree-Structured Semantic Operations
 Extracts semantic operations from MATLAB code while PRESERVING TREE STRUCTURE.
 Each operation includes its depth in the AST - this serves as position encoding.
 
-Uses the improved MATLAB grammar with proper switch/case support.
+Philosophy (like ViT but for code):
+- ViT: patches have 2D position (row, col)
+- This: operations have tree position (depth, and order)
+
+Output format:
+[
+    {'depth': 0, 'type': 'function', 'text': 'function y = test(x)'},
+    {'depth': 1, 'type': 'condition', 'text': 'x > 0'},
+    {'depth': 2, 'type': 'assignment', 'text': 'y = x * 2'},
+    ...
+]
 """
 import sys
 import os
@@ -33,114 +43,158 @@ except ImportError:
 @dataclass
 class SemanticNode:
     """A semantic operation with tree position info."""
-    depth: int
-    type: str
-    text: str
-    parent_type: Optional[str] = None
+    depth: int          # Depth in AST (0 = root)
+    type: str           # Operation type (assignment, condition, loop, etc.)
+    text: str           # The actual code text
+    parent_type: Optional[str] = None  # Parent node type for context
 
     def __repr__(self):
         indent = "  " * self.depth
         return f"{indent}[D{self.depth}] {self.type}: {self.text}"
 
 
-def get_text(node) -> str:
-    """Get full text from parse tree node."""
+# Semantic operation types we capture (smallest meaningful units)
+CAPTURE_RULES = {
+    'assignment_statement',
+    'expression_statement',
+    'global_statement',
+    'clear_statement',
+    'jump_statement',
+}
+
+# Structural rules we recurse into
+STRUCTURAL_RULES = {
+    'file_',
+    'translation_unit',
+    'statement_list',
+    'selection_statement',
+    'iteration_statement',
+    'elseif_clause',
+}
+
+
+def get_node_text(node) -> str:
+    """Extract full text from a parse tree node."""
     if node is None:
         return ""
     if not hasattr(node, 'children') or node.children is None:
-        return node.getText() or ""
-    return "".join(get_text(child) for child in node.children)
+        text = node.getText()
+        return text if text else ""
+    return "".join(get_node_text(child) for child in node.children)
 
 
 def clean_text(text: str) -> str:
     """Clean extracted text."""
     text = re.sub(r'\s+', ' ', text)
-    text = text.strip().rstrip(';').rstrip(',').strip()
+    text = text.strip().rstrip(';').strip()
+    # Remove newlines
+    text = text.replace('\n', ' ').replace('\r', '')
     return text
 
 
 def extract_tree_operations(tree, parser) -> list[SemanticNode]:
-    """Extract semantic operations with tree depth from new grammar."""
-    operations = []
+    """
+    Extract semantic operations preserving tree depth.
 
-    def get_rule_name(node):
-        if hasattr(node, 'getRuleIndex'):
-            return parser.ruleNames[node.getRuleIndex()]
-        return None
+    Returns list of SemanticNode with depth information.
+    """
+    operations = []
 
     def walk(node, depth: int = 0, parent_type: str = None):
         if node is None:
             return
 
-        rule = get_rule_name(node)
+        # Get rule name
+        rule_name = None
+        if hasattr(node, 'getRuleIndex'):
+            rule_name = parser.ruleNames[node.getRuleIndex()]
+
         children = list(node.children) if hasattr(node, 'children') and node.children else []
 
-        # === FUNCTION DEFINITION ===
-        if rule == 'def_function':
-            # Build signature from children BEFORE first statement
-            sig_parts = []
-            for child in children:
-                child_rule = get_rule_name(child)
-                if child_rule == 'statement':
-                    break  # Stop at first statement (body starts)
-                if child_rule == 'end_function':
-                    break
-                # Collect signature tokens
+        # === FUNCTION DECLARATION ===
+        if rule_name == 'translation_unit':
+            # Look for function keyword
+            for i, child in enumerate(children):
                 child_text = child.getText() if hasattr(child, 'getText') else ""
-                if child_text and child_text != 'end':
-                    sig_parts.append(child_text)
-
-            if sig_parts:
-                # Join with spaces for readability
-                sig_text = ' '.join(sig_parts)
-                # Clean up spacing around operators
-                sig_text = re.sub(r'\s*=\s*', ' = ', sig_text)
-                sig_text = re.sub(r'\s*\(\s*', '(', sig_text)
-                sig_text = re.sub(r'\s*\)\s*', ')', sig_text)
-                sig_text = re.sub(r'\s*,\s*', ', ', sig_text)
-                operations.append(SemanticNode(
-                    depth=depth,
-                    type='function',
-                    text=sig_text.strip(),
-                    parent_type=parent_type
-                ))
-
-            # Recurse into statements inside function
+                if child_text == 'function':
+                    # Get function declaration
+                    if i + 1 < len(children):
+                        func_decl = children[i + 1]
+                        func_text = clean_text(get_node_text(func_decl))
+                        operations.append(SemanticNode(
+                            depth=depth,
+                            type='function_decl',
+                            text=f"function {func_text}",
+                            parent_type=parent_type
+                        ))
+            # Recurse into statement list
             for child in children:
-                child_rule = get_rule_name(child)
-                if child_rule == 'statement':
-                    walk(child, depth + 1, 'function')
+                if hasattr(child, 'getRuleIndex'):
+                    child_rule = parser.ruleNames[child.getRuleIndex()]
+                    if child_rule == 'statement_list':
+                        walk(child, depth + 1, 'function')
             return
 
-        # === IF STATEMENT ===
-        if rule == 'st_if':
-            for i, child in enumerate(children):
+        # === SEMANTIC OPERATIONS (capture as single unit) ===
+        if rule_name in CAPTURE_RULES:
+            text = clean_text(get_node_text(node))
+            if text and len(text) > 1:
+                # Determine more specific type
+                op_type = rule_name.replace('_statement', '')
+                if '=' in text and op_type == 'expression':
+                    op_type = 'assignment'
+                operations.append(SemanticNode(
+                    depth=depth,
+                    type=op_type,
+                    text=text,
+                    parent_type=parent_type
+                ))
+            return  # Don't recurse into captured operations
+
+        # === IF/ELSEIF/ELSE (selection_statement) ===
+        if rule_name == 'selection_statement':
+            i = 0
+            while i < len(children):
+                child = children[i]
                 child_text = child.getText() if hasattr(child, 'getText') else ""
 
                 if child_text == 'if':
-                    # Get condition (next child should be xpr_tree)
+                    # Next child is condition
                     if i + 1 < len(children):
                         cond = children[i + 1]
-                        if get_rule_name(cond) == 'xpr_tree':
-                            cond_text = clean_text(get_text(cond))
+                        cond_text = clean_text(get_node_text(cond))
+                        if cond_text:
                             operations.append(SemanticNode(
                                 depth=depth,
-                                type='if',
+                                type='if_condition',
                                 text=f"if {cond_text}",
                                 parent_type=parent_type
                             ))
+                    # Find the statement_list (then body)
+                    if i + 2 < len(children):
+                        body = children[i + 2]
+                        if hasattr(body, 'getRuleIndex'):
+                            body_rule = parser.ruleNames[body.getRuleIndex()]
+                            if body_rule == 'statement_list':
+                                walk(body, depth + 1, 'if_then')
+                    i += 3
 
                 elif child_text == 'elseif':
                     if i + 1 < len(children):
                         cond = children[i + 1]
-                        if get_rule_name(cond) == 'xpr_tree':
-                            cond_text = clean_text(get_text(cond))
+                        cond_text = clean_text(get_node_text(cond))
+                        if cond_text:
                             operations.append(SemanticNode(
                                 depth=depth,
-                                type='elseif',
+                                type='elseif_condition',
                                 text=f"elseif {cond_text}",
                                 parent_type=parent_type
                             ))
+                    if i + 2 < len(children):
+                        body = children[i + 2]
+                        if hasattr(body, 'getRuleIndex'):
+                            walk(body, depth + 1, 'elseif')
+                    i += 3
 
                 elif child_text == 'else':
                     operations.append(SemanticNode(
@@ -149,204 +203,75 @@ def extract_tree_operations(tree, parser) -> list[SemanticNode]:
                         text='else',
                         parent_type=parent_type
                     ))
+                    # Next should be statement_list
+                    if i + 1 < len(children):
+                        body = children[i + 1]
+                        if hasattr(body, 'getRuleIndex'):
+                            walk(body, depth + 1, 'else')
+                    i += 2
 
-                elif get_rule_name(child) == 'statement':
-                    walk(child, depth + 1, 'if')
+                elif child_text == 'end':
+                    i += 1
+                else:
+                    # Check if it's a statement_list or elseif_clause
+                    if hasattr(child, 'getRuleIndex'):
+                        child_rule = parser.ruleNames[child.getRuleIndex()]
+                        if child_rule == 'elseif_clause':
+                            walk(child, depth, parent_type)
+                    i += 1
             return
 
-        # === FOR LOOP ===
-        if rule == 'st_for':
-            # Extract: for var = range
-            var_name = None
-            range_text = None
+        # === FOR/WHILE LOOPS (iteration_statement) ===
+        if rule_name == 'iteration_statement':
+            loop_type = None
+            loop_var = None
+            loop_range = None
+
             for i, child in enumerate(children):
                 child_text = child.getText() if hasattr(child, 'getText') else ""
-                child_rule = get_rule_name(child)
 
-                if child_rule == 'atom_var':
-                    var_name = child_text
-                elif child_rule == 'xpr_tree' and var_name:
-                    range_text = clean_text(get_text(child))
-                    break
-
-            if var_name and range_text:
-                operations.append(SemanticNode(
-                    depth=depth,
-                    type='for',
-                    text=f"for {var_name} = {range_text}",
-                    parent_type=parent_type
-                ))
-
-            # Recurse into statements
-            for child in children:
-                if get_rule_name(child) == 'statement':
-                    walk(child, depth + 1, 'for')
+                if child_text == 'for':
+                    loop_type = 'for'
+                elif child_text == 'while':
+                    loop_type = 'while'
+                elif child_text == '=' and loop_type == 'for':
+                    # Previous child is variable, next is range
+                    if i > 0:
+                        loop_var = children[i - 1].getText()
+                    if i + 1 < len(children):
+                        loop_range = clean_text(get_node_text(children[i + 1]))
+                elif hasattr(child, 'getRuleIndex'):
+                    child_rule = parser.ruleNames[child.getRuleIndex()]
+                    if child_rule == 'statement_list':
+                        # First add the loop header
+                        if loop_type == 'for' and loop_var and loop_range:
+                            operations.append(SemanticNode(
+                                depth=depth,
+                                type='for_loop',
+                                text=f"for {loop_var} = {loop_range}",
+                                parent_type=parent_type
+                            ))
+                        elif loop_type == 'while':
+                            # For while, the expression comes before statement_list
+                            operations.append(SemanticNode(
+                                depth=depth,
+                                type='while_loop',
+                                text=f"while {loop_range or '...'}",
+                                parent_type=parent_type
+                            ))
+                        # Then recurse into body
+                        walk(child, depth + 1, loop_type)
+                    elif child_rule == 'expression' and loop_type == 'while':
+                        loop_range = clean_text(get_node_text(child))
             return
 
-        # === WHILE LOOP ===
-        if rule == 'st_while':
-            for i, child in enumerate(children):
-                child_rule = get_rule_name(child)
-                if child_rule == 'xpr_tree':
-                    cond_text = clean_text(get_text(child))
-                    operations.append(SemanticNode(
-                        depth=depth,
-                        type='while',
-                        text=f"while {cond_text}",
-                        parent_type=parent_type
-                    ))
-                    break
-
-            for child in children:
-                if get_rule_name(child) == 'statement':
-                    walk(child, depth + 1, 'while')
-            return
-
-        # === SWITCH STATEMENT ===
-        if rule == 'st_switch':
-            switch_expr = None
-            for i, child in enumerate(children):
-                child_text = child.getText() if hasattr(child, 'getText') else ""
-                child_rule = get_rule_name(child)
-
-                if child_text == 'switch' and i + 1 < len(children):
-                    expr = children[i + 1]
-                    if get_rule_name(expr) == 'xpr_tree':
-                        switch_expr = clean_text(get_text(expr))
-                        operations.append(SemanticNode(
-                            depth=depth,
-                            type='switch',
-                            text=f"switch {switch_expr}",
-                            parent_type=parent_type
-                        ))
-
-                elif child_text == 'case' and i + 1 < len(children):
-                    expr = children[i + 1]
-                    if get_rule_name(expr) == 'xpr_tree':
-                        case_text = clean_text(get_text(expr))
-                        operations.append(SemanticNode(
-                            depth=depth + 1,
-                            type='case',
-                            text=f"case {case_text}",
-                            parent_type='switch'
-                        ))
-
-                elif child_text == 'otherwise':
-                    operations.append(SemanticNode(
-                        depth=depth + 1,
-                        type='otherwise',
-                        text='otherwise',
-                        parent_type='switch'
-                    ))
-
-                elif child_rule == 'statement':
-                    walk(child, depth + 2, 'case')
-            return
-
-        # === TRY/CATCH ===
-        if rule == 'st_try':
-            operations.append(SemanticNode(
-                depth=depth,
-                type='try',
-                text='try',
-                parent_type=parent_type
-            ))
-            for child in children:
-                child_text = child.getText() if hasattr(child, 'getText') else ""
-                if child_text == 'catch':
-                    operations.append(SemanticNode(
-                        depth=depth,
-                        type='catch',
-                        text='catch',
-                        parent_type='try'
-                    ))
-                elif get_rule_name(child) == 'statement':
-                    walk(child, depth + 1, 'try')
-            return
-
-        # === RETURN STATEMENT ===
-        if rule == 'st_return':
-            operations.append(SemanticNode(
-                depth=depth,
-                type='return',
-                text='return',
-                parent_type=parent_type
-            ))
-            return
-
-        # === BREAK STATEMENT ===
-        if rule == 'st_break':
-            operations.append(SemanticNode(
-                depth=depth,
-                type='break',
-                text='break',
-                parent_type=parent_type
-            ))
-            return
-
-        # === CONTINUE STATEMENT ===
-        if rule == 'st_continue':
-            operations.append(SemanticNode(
-                depth=depth,
-                type='continue',
-                text='continue',
-                parent_type=parent_type
-            ))
-            return
-
-        # === ASSIGNMENT ===
-        if rule == 'st_assign':
-            text = clean_text(get_text(node))
-            operations.append(SemanticNode(
-                depth=depth,
-                type='assignment',
-                text=text,
-                parent_type=parent_type
-            ))
-            return
-
-        # === FUNCTION CALL (as expression) ===
-        if rule == 'xpr_function':
-            text = clean_text(get_text(node))
-            operations.append(SemanticNode(
-                depth=depth,
-                type='call',
-                text=text,
-                parent_type=parent_type
-            ))
-            return
-
-        # === STATEMENT (wrapper) ===
-        if rule == 'statement':
-            # Check for return/break/continue by text (grammar may vary)
-            stmt_text = get_text(node).strip().rstrip(';').strip()
-            if stmt_text == 'return':
-                operations.append(SemanticNode(
-                    depth=depth, type='return', text='return', parent_type=parent_type
-                ))
-                return
-            elif stmt_text == 'break':
-                operations.append(SemanticNode(
-                    depth=depth, type='break', text='break', parent_type=parent_type
-                ))
-                return
-            elif stmt_text == 'continue':
-                operations.append(SemanticNode(
-                    depth=depth, type='continue', text='continue', parent_type=parent_type
-                ))
-                return
-            # Otherwise recurse into children
+        # === STATEMENT LIST (recurse) ===
+        if rule_name == 'statement_list':
             for child in children:
                 walk(child, depth, parent_type)
             return
 
-        # === TOP LEVEL ===
-        if rule in ('matlab_file', None):
-            for child in children:
-                walk(child, depth, parent_type)
-            return
-
-        # === DEFAULT: recurse ===
+        # === DEFAULT: recurse into children ===
         for child in children:
             walk(child, depth, parent_type)
 
@@ -361,9 +286,10 @@ def code_to_nodes(code: str, as_objects: bool = False) -> list:
     Args:
         code: MATLAB source code
         as_objects: If True, return SemanticNode objects
+                   If False, return strings with depth prefix
 
     Returns:
-        List of operations
+        List of operations (objects or strings depending on as_objects)
     """
     operations = []
 
@@ -384,24 +310,30 @@ def code_to_nodes(code: str, as_objects: bool = False) -> list:
             lexer.addErrorListener(Silent())
             parser_inst.addErrorListener(Silent())
 
-            tree = parser_inst.matlab_file()
+            tree = parser_inst.file_()
             operations = extract_tree_operations(tree, parser_inst)
 
-        except Exception as e:
+        except Exception:
             pass
 
+    # Fallback if ANTLR failed or not available
     if not operations:
         operations = fallback_extract(code)
 
     if as_objects:
         return operations
     else:
+        # Return strings with depth info: "[D2] assignment: x = 1"
         return [f"[D{op.depth}] {op.type}: {op.text}" for op in operations]
 
 
 def code_to_nodes_with_depth(code: str) -> tuple[list[str], list[int]]:
     """
-    Convert code to (texts, depths) tuple for the model.
+    Convert code to (texts, depths) tuple.
+
+    This is useful for the model:
+    - texts: list of operation strings for CodeBERT
+    - depths: list of depth values for position encoding
 
     Returns:
         (texts, depths) where both are aligned lists
@@ -415,53 +347,34 @@ def code_to_nodes_with_depth(code: str) -> tuple[list[str], list[int]]:
 def fallback_extract(code: str) -> list[SemanticNode]:
     """Fallback when ANTLR fails."""
     code = re.sub(r'%.*$', '', code, flags=re.MULTILINE)
-    operations = []
-    depth = 0
 
-    for line in code.split('\n'):
+    operations = []
+    lines = code.split('\n')
+
+    depth = 0
+    for line in lines:
         line = line.strip()
         if not line:
             continue
 
-        if line.startswith('function'):
-            operations.append(SemanticNode(depth=0, type='function', text=line.rstrip(';')))
-            depth = 1
-        elif line.startswith('if '):
-            operations.append(SemanticNode(depth=depth, type='if', text=line.rstrip(',')))
+        # Track depth based on keywords
+        if line.startswith(('function', 'if', 'for', 'while', 'switch', 'try')):
+            op_type = line.split()[0] if line.split() else 'block'
+            operations.append(SemanticNode(depth=depth, type=op_type, text=line.rstrip(';')))
             depth += 1
-        elif line.startswith('elseif '):
-            operations.append(SemanticNode(depth=max(0, depth-1), type='elseif', text=line.rstrip(',')))
-        elif line == 'else':
-            operations.append(SemanticNode(depth=max(0, depth-1), type='else', text='else'))
-        elif line.startswith('for '):
-            operations.append(SemanticNode(depth=depth, type='for', text=line.rstrip(',')))
-            depth += 1
-        elif line.startswith('while '):
-            operations.append(SemanticNode(depth=depth, type='while', text=line.rstrip(',')))
-            depth += 1
-        elif line.startswith('switch '):
-            operations.append(SemanticNode(depth=depth, type='switch', text=line))
-            depth += 1
-        elif line.startswith('case '):
-            operations.append(SemanticNode(depth=depth, type='case', text=line))
-        elif line == 'otherwise':
-            operations.append(SemanticNode(depth=depth, type='otherwise', text='otherwise'))
-        elif line == 'return' or line == 'return;':
-            operations.append(SemanticNode(depth=depth, type='return', text='return'))
-        elif line == 'break' or line == 'break;':
-            operations.append(SemanticNode(depth=depth, type='break', text='break'))
-        elif line == 'continue' or line == 'continue;':
-            operations.append(SemanticNode(depth=depth, type='continue', text='continue'))
+        elif line.startswith(('else', 'elseif', 'case', 'otherwise', 'catch')):
+            op_type = line.split()[0]
+            operations.append(SemanticNode(depth=max(0, depth-1), type=op_type, text=line.rstrip(';')))
         elif line == 'end':
             depth = max(0, depth - 1)
-        elif '=' in line and not line.startswith('='):
-            operations.append(SemanticNode(depth=depth, type='assignment', text=line.rstrip(';')))
-        elif line.endswith(')') or line.endswith(');'):
-            operations.append(SemanticNode(depth=depth, type='call', text=line.rstrip(';')))
+        elif '=' in line or line.endswith(';') or line.endswith(')'):
+            # Statement
+            operations.append(SemanticNode(depth=depth, type='statement', text=line.rstrip(';')))
 
     return operations
 
 
+# Backwards compatibility
 def code_to_ast_nodes(code: str) -> list[str]:
     return code_to_nodes(code, as_objects=False)
 
@@ -489,60 +402,28 @@ if __name__ == "__main__":
 
     ops = code_to_nodes(test_code, as_objects=True)
     print(f"\nFound {len(ops)} operations:\n")
+
     for op in ops:
         indent = "  " * op.depth
         print(f"{indent}[depth={op.depth}] {op.type}: {op.text}")
 
     print("\n" + "=" * 70)
-    print("SWITCH/CASE TEST")
+    print("AS STRINGS (for model input)")
     print("=" * 70)
 
-    switch_code = """
-    function result = test_switch(x)
-        switch x
-            case 1
-                result = 'one';
-            case 2
-                result = 'two';
-            otherwise
-                result = 'other';
-        end
-    end
-    """
-
-    ops = code_to_nodes(switch_code, as_objects=True)
-    print(f"\nFound {len(ops)} operations:\n")
-    for op in ops:
-        indent = "  " * op.depth
-        print(f"{indent}[depth={op.depth}] {op.type}: {op.text}")
+    strings = code_to_nodes(test_code, as_objects=False)
+    for s in strings:
+        print(f"  {s}")
 
     print("\n" + "=" * 70)
-    print("RETURN/BREAK/CONTINUE TEST")
+    print("SEPARATE TEXTS AND DEPTHS (for model)")
     print("=" * 70)
 
-    control_code = """
-    function result = find_value(arr, target)
-        for i = 1:length(arr)
-            if arr(i) == target
-                result = i;
-                return;
-            end
-            if arr(i) < 0
-                continue;
-            end
-            if arr(i) > 1000
-                break;
-            end
-        end
-        result = -1;
-    end
-    """
-
-    ops = code_to_nodes(control_code, as_objects=True)
-    print(f"\nFound {len(ops)} operations:\n")
-    for op in ops:
-        indent = "  " * op.depth
-        print(f"{indent}[depth={op.depth}] {op.type}: {op.text}")
+    texts, depths = code_to_nodes_with_depth(test_code)
+    print(f"\nTexts ({len(texts)}):")
+    for t in texts:
+        print(f"  '{t}'")
+    print(f"\nDepths: {depths}")
 
     print("\n" + "=" * 70)
     print("REAL FILE TEST")
@@ -556,12 +437,12 @@ if __name__ == "__main__":
         with open(real_file) as f:
             real_code = f.read()
         ops = code_to_nodes(real_code, as_objects=True)
-        print(f"\nFound {len(ops)} operations:\n")
-        for op in ops[:25]:
+        print(f"\nFound {len(ops)} operations in bresenham.m:\n")
+        for op in ops[:20]:
             indent = "  " * op.depth
             text = op.text[:50] + "..." if len(op.text) > 50 else op.text
             print(f"{indent}[D{op.depth}] {op.type}: {text}")
-        if len(ops) > 25:
-            print(f"\n  ... and {len(ops) - 25} more operations")
+        if len(ops) > 20:
+            print(f"\n  ... and {len(ops) - 20} more operations")
     except FileNotFoundError:
         print("  (file not found)")
