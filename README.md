@@ -35,7 +35,7 @@ A vision-transformer-inspired architecture for converting MATLAB code to natural
 ### 1. Install Dependencies
 
 ```bash
-pip install torch transformers datasets antlr4-python3-runtime
+pip install -r train/requirements.txt
 ```
 
 ### 2. ANTLR Grammar (if recompiling)
@@ -109,11 +109,6 @@ python -m train.inference --checkpoint checkpoints/best_model.pt --code "functio
 python -m train.inference --checkpoint checkpoints/best_model.pt --interactive
 ```
 
-### Test Pipeline (step-by-step debugging)
-
-```bash
-python -m train.train_with_func
-```
 
 ## Architecture Overview
 
