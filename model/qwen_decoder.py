@@ -4,13 +4,16 @@ Step 6: Qwen Decoder
 
 Frozen Qwen LLM that generates text from projected embeddings.
 
-Training: [projected patches] + [target text] → loss
-Inference: [projected patches] → generated text
+Training: [projected patches] + [PROMPT] + [target text] → loss (only on target)
+Inference: [projected patches] + [PROMPT] → generated text
 """
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Task prompt - same for all samples (train & test)
+PROMPT = "Convert the following MATLAB code to step-by-step pseudocode:\n"
 
 
 class QwenDecoder:
@@ -74,10 +77,13 @@ class QwenDecoder:
             target_text: ground truth pseudocode
 
         Returns:
-            loss: cross-entropy loss on text tokens
+            loss: cross-entropy loss on target text tokens only
         """
         # Add batch dimension: [num_patches, 1536] → [1, num_patches, 1536]
         projected = projected.unsqueeze(0)
+
+        # Get prompt embeddings
+        prompt_embeds, prompt_tokens = self.get_input_embeddings(PROMPT)
 
         # Get target embeddings
         target_embeds, target_tokens = self.get_input_embeddings(target_text)
@@ -85,23 +91,31 @@ class QwenDecoder:
         # Match dtype (Qwen may use float16)
         projected = projected.to(target_embeds.dtype)
 
-        # Concatenate: [patches] + [target text]
-        # Shape: [1, num_patches + num_text_tokens, 1536]
-        input_embeds = torch.cat([projected, target_embeds], dim=1)
+        # Concatenate: [patches] + [prompt] + [target text]
+        # Shape: [1, num_patches + num_prompt + num_target, 1536]
+        input_embeds = torch.cat([projected, prompt_embeds, target_embeds], dim=1)
 
         # Create attention mask
         num_patches = projected.shape[1]
+        num_prompt = prompt_embeds.shape[1]
         patch_mask = torch.ones(1, num_patches, device=self.device)
-        attn_mask = torch.cat([patch_mask, target_tokens.attention_mask], dim=1)
+        attn_mask = torch.cat([
+            patch_mask,
+            prompt_tokens.attention_mask,
+            target_tokens.attention_mask
+        ], dim=1)
 
         # Create labels
-        # -100 = ignore (don't compute loss on patch tokens)
-        # We only predict text tokens
+        # -100 = ignore (don't compute loss on patches or prompt)
+        # We only predict target text tokens
         patch_labels = torch.full(
             (1, num_patches), -100, dtype=torch.long, device=self.device
         )
-        text_labels = target_tokens.input_ids.clone()
-        labels = torch.cat([patch_labels, text_labels], dim=1)
+        prompt_labels = torch.full(
+            (1, num_prompt), -100, dtype=torch.long, device=self.device
+        )
+        target_labels = target_tokens.input_ids.clone()
+        labels = torch.cat([patch_labels, prompt_labels, target_labels], dim=1)
 
         # Forward through Qwen
         outputs = self.model(
@@ -135,9 +149,15 @@ class QwenDecoder:
         # Add batch dimension and match dtype
         projected = projected.unsqueeze(0).to(self.model.dtype)
 
+        # Get prompt embeddings
+        prompt_embeds, _ = self.get_input_embeddings(PROMPT)
+
+        # Concatenate: [patches] + [prompt]
+        input_embeds = torch.cat([projected, prompt_embeds], dim=1)
+
         # Generate
         outputs = self.model.generate(
-            inputs_embeds=projected,
+            inputs_embeds=input_embeds,
             max_new_tokens=max_new_tokens,
             do_sample=True,
             temperature=temperature,
