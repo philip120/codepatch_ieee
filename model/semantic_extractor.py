@@ -58,11 +58,12 @@ class SemanticExtractor:
                 - texts: list of operation text strings (for CodeBERT)
                 - depths: list of depth integers (for depth embedding)
                 - type_ids: list of type indices (for type embedding)
+                - ops: list of SemanticNode objects (for Recursive Encoder)
         """
         ops = code_to_nodes(code, as_objects=True)
 
         if not ops:
-            return {'texts': [], 'depths': [], 'type_ids': []}
+            return {'texts': [], 'depths': [], 'type_ids': [], 'ops': []}
 
         texts = [op.text for op in ops]
         depths = [min(op.depth, MAX_DEPTH - 1) for op in ops]
@@ -72,6 +73,7 @@ class SemanticExtractor:
             'texts': texts,
             'depths': depths,
             'type_ids': type_ids,
+            'ops': ops  # Add raw ops for recursive construction
         }
 
 
