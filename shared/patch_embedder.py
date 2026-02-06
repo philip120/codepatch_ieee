@@ -1,6 +1,6 @@
-# model/patch_embedder.py
+# shared/patch_embedder.py
 """
-Step 4: Patch Embedder
+Patch Embedder
 
 Groups pixel embeddings into patches (like ViT).
 

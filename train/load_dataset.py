@@ -8,16 +8,15 @@ def load_matlab_nl_dataset(split="train"):
     """
 
     ds = load_dataset(
-        "philip120/matlab-nl-pseudocode",
+        "philip120/matlab-nl-pseudocode-v2",
         split=split
     )
 
     examples = []
 
     for row in ds:
-        # Adjust field names if needed
-        code = row.get("matlab_code") or row.get("code")
-        nl   = row.get("nl_pseudocode") or row.get("pseudocode")
+        code = row.get("code")
+        nl   = row.get("nl")
 
         if not code or not nl:
             continue

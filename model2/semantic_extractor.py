@@ -13,8 +13,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from train.semantic_adapter import code_to_nodes, SemanticNode
 
-# Reuse type vocabulary from model 1
-from model.semantic_extractor import TYPE_TO_ID, NUM_TYPES, MAX_DEPTH, ID_TO_TYPE
+# Reuse type vocabulary from shared
+from shared.semantic_extractor import TYPE_TO_ID, NUM_TYPES, MAX_DEPTH, ID_TO_TYPE
 
 class TreeNode:
     """Wrapper for SemanticNode to support tree structure (children list)."""

@@ -2,7 +2,7 @@ import torch
 from torch.utils.data import Dataset
 import signal
 from train.load_dataset import load_matlab_nl_dataset
-from model.semantic_extractor import SemanticExtractor
+from shared.semantic_extractor import SemanticExtractor
 
 class MatlabPseudocodeDataset(Dataset):
     """

@@ -1,6 +1,6 @@
-# model/pixel_embedder.py
+# shared/pixel_embedder.py
 """
-Step 3: Pixel Embedder
+Pixel Embedder
 
 Combines CodeBERT CLS + depth embedding + type embedding.
 Trainable: depth_embedding, type_embedding

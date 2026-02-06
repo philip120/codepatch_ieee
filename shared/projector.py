@@ -1,6 +1,6 @@
-# model/projector.py
+# shared/projector.py
 """
-Step 5: Projector (Bottleneck MLP)
+Projector (Bottleneck MLP)
 
 Projects patch embeddings to Qwen's embedding space.
 

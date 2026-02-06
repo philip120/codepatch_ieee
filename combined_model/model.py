@@ -1,58 +1,82 @@
+# combined_model/model.py
 """
-Structural Model (Model 2) - Tree-only pipeline
+Combined Semantic ViT - Dual pathway model
 
-Structural path only:
-    Code -> SemanticExtractorV2 -> CodeBERT -> PixelEmbedder -> PixelAdapter -> RecursiveEncoder -> QwenDecoder
+Fuses both ViT (sequential) and RvNN (structural) paths:
+
+    Code -> CodeBERT -> PixelEmbedder
+        ├── PatchEmbedder -> Projector       -> [M, 1536]  (ViT path)
+        └── PixelAdapter  -> RecursiveEncoder -> [1, 1536]  (Tree path)
+                            ↓
+                 cat([global, seq]) -> [M+1, 1536]
+                            ↓
+                       QwenDecoder
 """
 import torch
 import torch.nn as nn
 
-from .semantic_extractor import SemanticExtractorV2
+from model2.semantic_extractor import SemanticExtractorV2
 from shared.codebert_encoder import CodeBERTEncoder
 from shared.pixel_embedder import PixelEmbedder
+from shared.patch_embedder import PatchEmbedder
+from shared.projector import Projector
 from shared.semantic_extractor import MAX_DEPTH, NUM_TYPES
 from shared.qwen_decoder import QwenDecoder
-from .recursive_encoder import RecursiveEncoder
+from model2.recursive_encoder import RecursiveEncoder
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-class StructuralModel(nn.Module):
+class CombinedSemanticViT(nn.Module):
     """
-    Tree-only model for code-to-pseudocode.
+    Combined model with both ViT and Tree pathways.
 
-    Uses recursive tree encoding of the AST to produce a global vector.
+    Trainable:
+        - PixelEmbedder (shared between paths)
+        - PatchEmbedder + Projector (ViT path)
+        - PixelAdapter + RecursiveEncoder (Tree path)
 
-    Trainable: PixelEmbedder, PixelAdapter, RecursiveEncoder
-    Frozen: CodeBERTEncoder, QwenDecoder
+    Frozen:
+        - CodeBERTEncoder
+        - QwenDecoder
     """
 
     def __init__(
         self,
+        patch_size: int = 4,
+        bottleneck_dim: int = 512,
         dropout: float = 0.4,
     ):
         super().__init__()
 
-        # Extractor (tree-aware)
+        # Extractor (tree-aware, needed for both paths)
         self.extractor = SemanticExtractorV2()
 
         # Base Encoder (frozen)
         self.encoder = CodeBERTEncoder(device=DEVICE)
 
-        # Pixel Embedder (trainable)
+        # Pixel Embedder (trainable, shared)
         self.pixel_embedder = PixelEmbedder(
             max_depth=MAX_DEPTH,
             num_types=NUM_TYPES
         ).to(DEVICE)
 
-        # Adapt pixel (768) to Recursive dim (1536)
+        # --- PATH 1: SEQUENTIAL (ViT) ---
+        self.patch_embedder = PatchEmbedder(patch_size=patch_size)
+        self.projector = Projector(
+            in_dim=patch_size * 768,
+            bottleneck_dim=bottleneck_dim,
+            out_dim=1536,
+            dropout=dropout
+        ).to(DEVICE)
+
+        # --- PATH 2: STRUCTURAL (RvNN) ---
         self.pixel_adapter = nn.Sequential(
             nn.Linear(768, 1536),
             nn.LayerNorm(1536),
             nn.GELU()
         ).to(DEVICE)
 
-        # Recursive Encoder (tree aggregation)
         self.recursive_encoder = RecursiveEncoder(
             embed_dim=1536,
             max_branching=8,
@@ -60,13 +84,17 @@ class StructuralModel(nn.Module):
             dropout=dropout
         ).to(DEVICE)
 
-        # Decoder (frozen)
+        # --- DECODER ---
         self.decoder = QwenDecoder(device=DEVICE)
 
     def get_trainable_parameters(self):
-        """Return only trainable parameters for optimizer."""
+        """Return all trainable parameters from both paths."""
         params = []
+        # Shared
         params.extend(self.pixel_embedder.parameters())
+        # ViT path
+        params.extend(self.projector.parameters())
+        # Tree path
         params.extend(self.pixel_adapter.parameters())
         params.extend(self.recursive_encoder.parameters())
         return params
@@ -90,23 +118,31 @@ class StructuralModel(nn.Module):
         depth_ids = torch.tensor(features['depths'], device=DEVICE)
         type_ids = torch.tensor(features['type_ids'], device=DEVICE)
 
-        # 3. Pixel Embeddings [N, 768]
+        # 3. Pixel Embeddings [N, 768] (shared)
         pixel_embeddings = self.pixel_embedder(cls_embeddings, depth_ids, type_ids)
 
-        # 4. Adapt for tree: [N, 768] -> [1, N, 1536]
-        pixels_for_tree = self.pixel_adapter(pixel_embeddings).unsqueeze(0)
+        # --- PATH 1: Sequential ---
+        # [N, 768] -> [M, 3072] -> [M, 1536]
+        patch_embeddings = self.patch_embedder(pixel_embeddings)
+        seq_vectors = self.projector(patch_embeddings)
 
-        # 5. Recursive tree traversal -> [1, 1536]
+        # --- PATH 2: Structural ---
+        # [N, 768] -> [1, N, 1536] -> [1, 1536]
+        pixels_for_tree = self.pixel_adapter(pixel_embeddings).unsqueeze(0)
         global_vector = self.recursive_encoder.forward_tree(
             features['tree_roots'],
             pixels_for_tree
         )
 
-        # 6. Decode
+        # --- FUSION ---
+        # [1, 1536] + [M, 1536] -> [M+1, 1536]
+        combined = torch.cat([global_vector, seq_vectors], dim=0)
+
+        # --- DECODE ---
         if target:
-            return self.decoder.forward_train(global_vector, target)
+            return self.decoder.forward_train(combined, target)
         else:
-            return global_vector
+            return combined
 
     @torch.no_grad()
     def generate(self, code: str, max_new_tokens: int = 128):

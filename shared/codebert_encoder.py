@@ -1,6 +1,6 @@
-# model/codebert_encoder.py
+# shared/codebert_encoder.py
 """
-Step 2: CodeBERT Encoder
+CodeBERT Encoder
 
 Frozen CodeBERT that extracts CLS token for each pixel text.
 """

@@ -1,6 +1,6 @@
-# model/qwen_decoder.py
+# shared/qwen_decoder.py
 """
-Step 6: Qwen Decoder
+Qwen Decoder
 
 Frozen Qwen LLM that generates text from projected embeddings.
 

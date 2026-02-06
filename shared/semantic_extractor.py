@@ -1,6 +1,6 @@
-# model/semantic_extractor.py
+# shared/semantic_extractor.py
 """
-Step 1: Semantic Extraction
+Semantic Extraction
 
 Extracts semantic operations from MATLAB code.
 Each operation becomes a "pixel".
