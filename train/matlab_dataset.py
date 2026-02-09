@@ -10,12 +10,16 @@ class MatlabPseudocodeDataset(Dataset):
     Pre-computes semantic features to avoid parsing overhead during training.
     """
 
-    def __init__(self, split: str = "train"):
+    def __init__(self, split: str = "train", model_type: str = "vit"):
         print(f"Loading dataset from Hugging Face (split={split})...")
         raw_data = load_matlab_nl_dataset(split)
-        
+
         self.data = []
-        extractor = SemanticExtractor()
+        if model_type in ("combined", "tree"):
+            from model2.semantic_extractor import SemanticExtractorV2
+            extractor = SemanticExtractorV2()
+        else:
+            extractor = SemanticExtractor()
         
         print(f"Preprocessing {len(raw_data)} samples (extracting semantic features)...")
         # Use tqdm if available
