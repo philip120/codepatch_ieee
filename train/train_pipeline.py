@@ -15,10 +15,16 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import json
 import torch
 from torch.utils.data import DataLoader
 import argparse
 from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 
 from train.load_dataset import load_matlab_nl_dataset
 from train.matlab_dataset import MatlabPseudocodeDataset
@@ -129,6 +135,7 @@ def train(
     accumulation_step = 0
     running_loss = 0.0
     best_loss = float('inf')
+    loss_history = []
 
     # Set trainable modules to train mode
     for param_group in model.get_trainable_parameters():
@@ -176,6 +183,7 @@ def train(
                     avg_loss = running_loss / (log_every * gradient_accumulation)
                     lr_now = scheduler.get_last_lr()[0]
                     print(f"  step {global_step:4d} | loss {avg_loss:.4f} | lr {lr_now:.2e}")
+                    loss_history.append((global_step, avg_loss))
                     running_loss = 0.0
 
                 # Evaluation
@@ -231,9 +239,97 @@ def train(
             torch.save(checkpoint, save_path / "best_model.pt")
             print(f"  New best model! Loss: {best_loss:.4f}")
 
+    # ==================================================================
+    # POST-TRAINING: BLEU evaluation on test set
+    # ==================================================================
+    print("\n" + "=" * 60)
+    print("EVALUATING ON TEST SET (BLEU)...")
+    print("=" * 60)
+
+    model.eval()
+    test_dataset = MatlabPseudocodeDataset(split="test")
+    smoother = SmoothingFunction().method1
+    bleu_scores = []
+
+    for i, sample in enumerate(test_dataset):
+        code = sample['code']
+        reference = sample['target']
+        features = sample.get('features')
+
+        try:
+            generated = model.generate(code, max_new_tokens=128)
+        except Exception as e:
+            print(f"  [sample {i}] generation failed: {e}")
+            continue
+
+        ref_tokens = reference.split()
+        gen_tokens = generated.split()
+        score = sentence_bleu(
+            [ref_tokens], gen_tokens, smoothing_function=smoother
+        )
+        bleu_scores.append(score)
+
+        if i < 5:
+            print(f"  Sample {i}: BLEU={score:.4f}")
+            print(f"    ref:  {reference[:80]}...")
+            print(f"    gen:  {generated[:80]}...")
+
+    avg_bleu = sum(bleu_scores) / len(bleu_scores) if bleu_scores else 0.0
+    print(f"\nAverage BLEU ({len(bleu_scores)} samples): {avg_bleu:.4f}")
+
+    # ==================================================================
+    # SAVE GRAPHS
+    # ==================================================================
+    print("\nSaving graphs...")
+
+    # --- Loss curve ---
+    if loss_history:
+        steps, losses = zip(*loss_history)
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.plot(steps, losses, linewidth=1.5)
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Loss")
+        ax.set_title(f"Training Loss ({model_type})")
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(save_path / "loss_curve.png", dpi=150)
+        plt.close(fig)
+        print(f"  Saved {save_path / 'loss_curve.png'}")
+
+    # --- BLEU histogram ---
+    if bleu_scores:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.hist(bleu_scores, bins=30, edgecolor="black", alpha=0.7)
+        ax.axvline(avg_bleu, color="red", linestyle="--", linewidth=1.5,
+                   label=f"Mean BLEU = {avg_bleu:.4f}")
+        ax.set_xlabel("BLEU Score")
+        ax.set_ylabel("Count")
+        ax.set_title(f"Per-Sample BLEU Distribution ({model_type})")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(save_path / "bleu_scores.png", dpi=150)
+        plt.close(fig)
+        print(f"  Saved {save_path / 'bleu_scores.png'}")
+
+    # --- Raw metrics JSON ---
+    metrics = {
+        "loss_history": [{"step": s, "loss": l} for s, l in loss_history],
+        "bleu_scores": bleu_scores,
+        "avg_bleu": avg_bleu,
+        "best_loss": best_loss,
+        "total_steps": global_step,
+        "epochs": epochs,
+        "model_type": model_type,
+    }
+    with open(save_path / "metrics.json", "w") as f:
+        json.dump(metrics, f, indent=2)
+    print(f"  Saved {save_path / 'metrics.json'}")
+
     print("\n" + "=" * 60)
     print("TRAINING COMPLETE")
     print(f"Best loss: {best_loss:.4f}")
+    print(f"Avg BLEU:  {avg_bleu:.4f}")
     print(f"Checkpoints saved to: {save_path}")
     print("=" * 60)
 
