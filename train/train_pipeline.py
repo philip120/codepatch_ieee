@@ -31,6 +31,10 @@ from train.matlab_dataset import MatlabPseudocodeDataset
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# cuDNN auto-tuner: picks fastest algorithms for the hardware
+if DEVICE == "cuda":
+    torch.backends.cudnn.benchmark = True
+
 
 def create_model(model_type: str, patch_size: int, bottleneck_dim: int, dropout: float):
     """Create model based on type selection."""
@@ -69,12 +73,12 @@ def train(
     weight_decay: float = 0.05,
     patch_size: int = 4,
     bottleneck_dim: int = 512,
-    dropout: float = 0.4,
+    dropout: float = 0.15,
     log_every: int = 10,
     eval_every: int = 50,
     save_every: int = 100,
     save_dir: str = "checkpoints",
-    gradient_accumulation: int = 4,
+    gradient_accumulation: int = 2,
 ):
     """Main training function."""
     print("=" * 60)
@@ -89,6 +93,7 @@ def train(
     print(f"Bottleneck: {bottleneck_dim}")
     print(f"Dropout: {dropout}")
     print(f"Gradient accumulation: {gradient_accumulation}")
+    print(f"Mixed precision (AMP): {DEVICE == 'cuda'}")
 
     # Create save directory
     save_path = Path(save_dir) / model_type
@@ -118,13 +123,19 @@ def train(
         weight_decay=weight_decay,
     )
 
-    # Learning rate scheduler
+    # Learning rate scheduler — warmup + cosine decay
     total_steps = epochs * len(loader) // gradient_accumulation
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        T_max=total_steps,
-        eta_min=1e-6,
+        max_lr=3e-4,
+        total_steps=total_steps,
+        pct_start=0.1,
+        anneal_strategy="cos",
     )
+
+    # Mixed precision (AMP) — only on CUDA
+    use_amp = DEVICE == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     # Training loop
     print("\n" + "=" * 60)
@@ -155,15 +166,16 @@ def train(
             target = batch['target']
             features = batch.get('features')
 
-            # Forward pass
-            loss = model(code, target=target, features=features)
+            # Forward pass (mixed precision)
+            with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+                loss = model(code, target=target, features=features)
 
             if loss is None or loss.item() == 0:
                 continue
 
             # Scale loss for gradient accumulation
             loss = loss / gradient_accumulation
-            loss.backward()
+            scaler.scale(loss).backward()
 
             accumulation_step += 1
             running_loss += loss.item() * gradient_accumulation
@@ -172,8 +184,10 @@ def train(
 
             # Update weights after accumulation
             if accumulation_step % gradient_accumulation == 0:
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.get_trainable_parameters(), max_norm=1.0)
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
@@ -351,12 +365,12 @@ if __name__ == "__main__":
     parser.add_argument("--weight_decay", type=float, default=0.05)
     parser.add_argument("--patch_size", type=int, default=4)
     parser.add_argument("--bottleneck", type=int, default=512)
-    parser.add_argument("--dropout", type=float, default=0.4)
+    parser.add_argument("--dropout", type=float, default=0.15)
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--eval_every", type=int, default=50)
     parser.add_argument("--save_every", type=int, default=100)
     parser.add_argument("--save_dir", type=str, default="checkpoints")
-    parser.add_argument("--grad_accum", type=int, default=4)
+    parser.add_argument("--grad_accum", type=int, default=2)
 
     args = parser.parse_args()
 
