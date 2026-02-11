@@ -326,6 +326,7 @@ def train(
     test_dataset = MatlabPseudocodeDataset(split="test", model_type=model_type)
     smoother = SmoothingFunction().method1
     bleu_scores = []
+    efficiency_metrics = []
 
     for i, sample in enumerate(test_dataset):
         code = sample['code']
@@ -333,7 +334,7 @@ def train(
         features = sample.get('features')
 
         try:
-            generated = model.generate(code, max_new_tokens=128)
+            generated, eff = model.generate_with_metrics(code, max_new_tokens=128)
         except Exception as e:
             print(f"  [sample {i}] generation failed: {e}")
             continue
@@ -344,14 +345,33 @@ def train(
             [ref_tokens], gen_tokens, smoothing_function=smoother
         )
         bleu_scores.append(score)
+        efficiency_metrics.append(eff)
 
         if i < 5:
             print(f"  Sample {i}: BLEU={score:.4f}")
             print(f"    ref:  {reference[:80]}...")
             print(f"    gen:  {generated[:80]}...")
+            print(f"    encode={eff.get('encode_time_s',0):.3f}s  "
+                  f"generate={eff.get('generate_time_s',0):.3f}s  "
+                  f"tok/s={eff.get('tokens_per_sec',0):.1f}  "
+                  f"kv_cache={eff.get('kv_cache_mb',0):.1f}MB")
 
     avg_bleu = sum(bleu_scores) / len(bleu_scores) if bleu_scores else 0.0
     print(f"\nAverage BLEU ({len(bleu_scores)} samples): {avg_bleu:.4f}")
+
+    # Efficiency summary
+    if efficiency_metrics:
+        def avg_key(key):
+            vals = [m[key] for m in efficiency_metrics if key in m]
+            return sum(vals) / len(vals) if vals else 0.0
+
+        print(f"\nInference Efficiency ({len(efficiency_metrics)} samples):")
+        print(f"  Avg encode time:    {avg_key('encode_time_s'):.4f}s")
+        print(f"  Avg generate time:  {avg_key('generate_time_s'):.4f}s")
+        print(f"  Avg total time:     {avg_key('total_time_s'):.4f}s")
+        print(f"  Avg tokens/sec:     {avg_key('tokens_per_sec'):.1f}")
+        print(f"  Avg KV cache:       {avg_key('kv_cache_mb'):.2f} MB")
+        print(f"  Avg peak VRAM:      {avg_key('peak_vram_mb'):.1f} MB")
 
     # ==================================================================
     # SAVE GRAPHS
@@ -397,6 +417,7 @@ def train(
         "total_steps": global_step,
         "epochs": epochs,
         "model_type": model_type,
+        "efficiency": efficiency_metrics,
     }
     with open(save_path / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
