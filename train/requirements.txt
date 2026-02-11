@@ -7,3 +7,4 @@ datasets
 antlr4-python3-runtime
 matplotlib
 nltk
+peft

@@ -12,6 +12,7 @@ Fuses both ViT (sequential) and RvNN (structural) paths:
                             ↓
                        QwenDecoder
 """
+import time
 import torch
 import torch.nn as nn
 
@@ -97,7 +98,24 @@ class CombinedSemanticViT(nn.Module):
         # Tree path
         params.extend(self.pixel_adapter.parameters())
         params.extend(self.recursive_encoder.parameters())
+        # LoRA (if enabled)
+        params.extend(self.decoder.get_lora_parameters())
         return params
+
+    def enable_lora(self, **kwargs):
+        """Enable LoRA on the Qwen decoder."""
+        self.decoder.enable_lora(**kwargs)
+
+    def train(self, mode=True):
+        super().train(mode)
+        if mode:
+            self.decoder.train_mode()
+        else:
+            self.decoder.eval_mode()
+        return self
+
+    def eval(self):
+        return self.train(False)
 
     def num_trainable_parameters(self):
         return sum(p.numel() for p in self.get_trainable_parameters())
@@ -150,3 +168,34 @@ class CombinedSemanticViT(nn.Module):
         if projected is None:
             return ""
         return self.decoder.generate(projected, max_new_tokens=max_new_tokens)
+
+    @torch.no_grad()
+    def generate_with_metrics(self, code: str, max_new_tokens: int = 128):
+        """Generate text and return (text, efficiency_metrics)."""
+        if DEVICE == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.synchronize()
+
+        t0 = time.perf_counter()
+        projected = self.forward(code)
+        if DEVICE == "cuda":
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+
+        if projected is None:
+            return "", {}
+
+        text, dec_metrics = self.decoder.generate_with_metrics(
+            projected, max_new_tokens=max_new_tokens
+        )
+
+        peak_vram_mb = 0.0
+        if DEVICE == "cuda":
+            peak_vram_mb = torch.cuda.max_memory_allocated() / (1024**2)
+
+        return text, {
+            "encode_time_s": round(t1 - t0, 4),
+            "total_time_s": round(time.perf_counter() - t0, 4),
+            "peak_vram_mb": round(peak_vram_mb, 1),
+            **dec_metrics,
+        }

@@ -79,6 +79,12 @@ def train(
     save_every: int = 100,
     save_dir: str = "checkpoints",
     gradient_accumulation: int = 2,
+    lora: bool = False,
+    lora_rank: int = 16,
+    lora_alpha: int = 32,
+    lora_dropout: float = 0.05,
+    lora_layers: int = 6,
+    resume: str = None,
 ):
     """Main training function."""
     print("=" * 60)
@@ -94,6 +100,9 @@ def train(
     print(f"Dropout: {dropout}")
     print(f"Gradient accumulation: {gradient_accumulation}")
     print(f"Mixed precision (AMP): {DEVICE == 'cuda'}")
+    print(f"LoRA: {lora} (rank={lora_rank}, alpha={lora_alpha}, layers={lora_layers})")
+    if resume:
+        print(f"Resuming from: {resume}")
 
     # Create save directory
     save_path = Path(save_dir) / model_type
@@ -113,6 +122,15 @@ def train(
     print("\n" + "=" * 60)
     print("Creating model...")
     model = create_model(model_type, patch_size, bottleneck_dim, dropout)
+
+    # Enable LoRA before optimizer so get_trainable_parameters() includes LoRA params
+    if lora:
+        model.enable_lora(
+            rank=lora_rank,
+            alpha=lora_alpha,
+            dropout=lora_dropout,
+            num_layers=lora_layers,
+        )
 
     print(f"\nTrainable parameters: {model.num_trainable_parameters():,}")
 
@@ -143,17 +161,51 @@ def train(
     print("=" * 60)
 
     global_step = 0
+    start_epoch = 0
     accumulation_step = 0
     running_loss = 0.0
     best_loss = float('inf')
     loss_history = []
 
-    # Set trainable modules to train mode
-    for param_group in model.get_trainable_parameters():
-        pass  # Parameters are already set
+    # Resume from checkpoint
+    if resume:
+        print(f"\nResuming from {resume}...")
+        ckpt = torch.load(resume, map_location=DEVICE, weights_only=False)
+
+        # Restore trainable parameters
+        if 'model_state' in ckpt:
+            model_params = dict(model.named_parameters())
+            loaded = 0
+            for name, data in ckpt['model_state'].items():
+                if name in model_params and model_params[name].requires_grad:
+                    model_params[name].data.copy_(data)
+                    loaded += 1
+            print(f"  Restored {loaded} parameter tensors")
+
+        # Restore LoRA state
+        if lora and 'lora_state' in ckpt and ckpt['lora_state']:
+            model.decoder.load_lora_state_dict(ckpt['lora_state'])
+
+        # Restore optimizer, scheduler, scaler
+        if 'optimizer' in ckpt:
+            optimizer.load_state_dict(ckpt['optimizer'])
+        if 'scheduler' in ckpt:
+            scheduler.load_state_dict(ckpt['scheduler'])
+        if 'scaler' in ckpt and use_amp:
+            scaler.load_state_dict(ckpt['scaler'])
+
+        # Restore progress
+        global_step = ckpt.get('step', 0)
+        start_epoch = ckpt.get('epoch', 0)
+        best_loss = ckpt.get('best_loss', ckpt.get('loss', float('inf')))
+        loss_history = ckpt.get('loss_history', [])
+        accumulation_step = global_step * gradient_accumulation
+
+        print(f"  Resumed at epoch {start_epoch + 1}, step {global_step}, best_loss {best_loss:.4f}")
+
     model.train()
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         print(f"\n{'='*60}")
         print(f"EPOCH {epoch + 1}/{epochs}")
         print(f"{'='*60}")
@@ -227,7 +279,11 @@ def train(
                         },
                         'optimizer': optimizer.state_dict(),
                         'scheduler': scheduler.state_dict(),
+                        'scaler': scaler.state_dict(),
                         'loss': epoch_loss / max(epoch_samples, 1),
+                        'best_loss': best_loss,
+                        'loss_history': loss_history,
+                        'lora_state': model.decoder.get_lora_state_dict() if lora else {},
                     }
                     torch.save(checkpoint, save_path / f"checkpoint_{global_step}.pt")
                     print(f"  Saved checkpoint_{global_step}.pt")
@@ -248,7 +304,13 @@ def train(
                     for name, param in model.named_parameters()
                     if param.requires_grad
                 },
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'scaler': scaler.state_dict(),
                 'loss': best_loss,
+                'best_loss': best_loss,
+                'loss_history': loss_history,
+                'lora_state': model.decoder.get_lora_state_dict() if lora else {},
             }
             torch.save(checkpoint, save_path / "best_model.pt")
             print(f"  New best model! Loss: {best_loss:.4f}")
@@ -372,6 +434,16 @@ if __name__ == "__main__":
     parser.add_argument("--save_dir", type=str, default="checkpoints")
     parser.add_argument("--grad_accum", type=int, default=2)
 
+    # LoRA
+    parser.add_argument("--lora", action="store_true", help="Enable LoRA on Qwen decoder")
+    parser.add_argument("--lora_rank", type=int, default=16)
+    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--lora_layers", type=int, default=6, help="Number of last Qwen layers to apply LoRA")
+
+    # Resume
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+
     args = parser.parse_args()
 
     train(
@@ -388,4 +460,10 @@ if __name__ == "__main__":
         save_every=args.save_every,
         save_dir=args.save_dir,
         gradient_accumulation=args.grad_accum,
+        lora=args.lora,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        lora_layers=args.lora_layers,
+        resume=args.resume,
     )

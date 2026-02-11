@@ -7,8 +7,10 @@ Frozen Qwen LLM that generates text from projected embeddings.
 Training: [projected patches] + [PROMPT] + [target text] → loss (only on target)
 Inference: [projected patches] + [PROMPT] → generated text
 """
+import time
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import get_peft_model, LoraConfig, TaskType
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -49,7 +51,63 @@ class QwenDecoder:
         for param in self.model.parameters():
             param.requires_grad = False
 
+        self.lora_enabled = False
+
         print(f"Qwen loaded on {self.device} (frozen)")
+
+    def enable_lora(self, rank: int = 16, alpha: int = 32, dropout: float = 0.05, num_layers: int = 6):
+        """Apply LoRA adapters to the last `num_layers` Qwen layers."""
+        total_layers = self.model.config.num_hidden_layers  # 28 for Qwen2-1.5B
+        target_layers = list(range(total_layers - num_layers, total_layers))
+        target_modules = [
+            f"model.layers.{i}.self_attn.{proj}"
+            for i in target_layers
+            for proj in ("q_proj", "v_proj")
+        ]
+
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=rank,
+            lora_alpha=alpha,
+            lora_dropout=dropout,
+            target_modules=target_modules,
+        )
+
+        self.model = get_peft_model(self.model, lora_config)
+        self.lora_enabled = True
+        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        print(f"LoRA enabled: {trainable:,} trainable params on layers {target_layers}")
+
+    def get_lora_parameters(self):
+        """Return LoRA trainable parameters."""
+        if not self.lora_enabled:
+            return []
+        return [p for p in self.model.parameters() if p.requires_grad]
+
+    def get_lora_state_dict(self):
+        """Return LoRA adapter state dict for checkpointing."""
+        if not self.lora_enabled:
+            return {}
+        return {
+            k: v for k, v in self.model.state_dict().items()
+            if "lora_" in k
+        }
+
+    def load_lora_state_dict(self, state_dict):
+        """Load LoRA adapter weights from checkpoint."""
+        if not self.lora_enabled or not state_dict:
+            return
+        self.model.load_state_dict(state_dict, strict=False)
+        print(f"Loaded LoRA state ({len(state_dict)} tensors)")
+
+    def train_mode(self):
+        """Set Qwen to train mode (needed for LoRA dropout)."""
+        if self.lora_enabled:
+            self.model.train()
+
+    def eval_mode(self):
+        """Set Qwen to eval mode."""
+        self.model.eval()
 
     def get_input_embeddings(self, text: str) -> torch.Tensor:
         """Get Qwen's embeddings for text tokens."""
@@ -166,6 +224,58 @@ class QwenDecoder:
         )
 
         return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+    @torch.no_grad()
+    def generate_with_metrics(
+        self,
+        projected: torch.Tensor,
+        max_new_tokens: int = 128,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+    ) -> tuple:
+        """Generate text and return (text, metrics_dict)."""
+        projected = projected.unsqueeze(0).to(self.model.dtype)
+        prompt_embeds, _ = self.get_input_embeddings(PROMPT)
+        input_embeds = torch.cat([projected, prompt_embeds], dim=1)
+        num_input_tokens = input_embeds.shape[1]
+
+        if self.device == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
+        outputs = self.model.generate(
+            inputs_embeds=input_embeds,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+            pad_token_id=self.tokenizer.eos_token_id,
+        )
+
+        if self.device == "cuda":
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+
+        text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        num_generated = outputs.shape[1]
+
+        # KV cache size: 2 (K+V) × layers × kv_heads × head_dim × seq_len × 2 bytes (fp16)
+        config = self.model.config
+        num_layers = config.num_hidden_layers
+        num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
+        head_dim = config.hidden_size // config.num_attention_heads
+        total_seq_len = num_input_tokens + num_generated
+        kv_cache_bytes = 2 * num_layers * num_kv_heads * head_dim * total_seq_len * 2
+
+        generate_time = t1 - t0
+
+        return text, {
+            "num_input_tokens": num_input_tokens,
+            "num_generated_tokens": num_generated,
+            "generate_time_s": round(generate_time, 4),
+            "tokens_per_sec": round(num_generated / generate_time, 1) if generate_time > 0 else 0,
+            "kv_cache_mb": round(kv_cache_bytes / (1024**2), 2),
+        }
 
 
 if __name__ == "__main__":
