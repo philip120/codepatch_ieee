@@ -84,6 +84,7 @@ def train(
     lora_alpha: int = 32,
     lora_dropout: float = 0.05,
     lora_layers: int = 6,
+    lora_lr: float = 1e-4,
     resume: str = None,
 ):
     """Main training function."""
@@ -100,7 +101,7 @@ def train(
     print(f"Dropout: {dropout}")
     print(f"Gradient accumulation: {gradient_accumulation}")
     print(f"Mixed precision (AMP): {DEVICE == 'cuda'}")
-    print(f"LoRA: {lora} (rank={lora_rank}, alpha={lora_alpha}, layers={lora_layers})")
+    print(f"LoRA: {lora} (rank={lora_rank}, alpha={lora_alpha}, layers={lora_layers}, lora_lr={lora_lr})")
     if resume:
         print(f"Resuming from: {resume}")
 
@@ -134,18 +135,29 @@ def train(
 
     print(f"\nTrainable parameters: {model.num_trainable_parameters():,}")
 
-    # Optimizer
-    optimizer = torch.optim.AdamW(
-        model.get_trainable_parameters(),
-        lr=lr,
-        weight_decay=weight_decay,
-    )
+    # Optimizer — separate LR groups when LoRA is active
+    if lora:
+        lora_ids = set(id(p) for p in model.decoder.get_lora_parameters())
+        base_params = [p for p in model.get_trainable_parameters() if id(p) not in lora_ids]
+        lora_params = list(model.decoder.get_lora_parameters())
+        optimizer = torch.optim.AdamW([
+            {'params': base_params, 'lr': lr},
+            {'params': lora_params, 'lr': lora_lr},
+        ], weight_decay=weight_decay)
+        print(f"\nParam groups: base ({len(base_params)} tensors, lr={lr}) "
+              f"+ LoRA ({len(lora_params)} tensors, lr={lora_lr})")
+    else:
+        optimizer = torch.optim.AdamW(
+            model.get_trainable_parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+        )
 
     # Learning rate scheduler — warmup + cosine decay
     total_steps = epochs * len(loader) // gradient_accumulation
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=3e-4,
+        max_lr=[lr, lora_lr] if lora else lr,
         total_steps=total_steps,
         pct_start=0.1,
         anneal_strategy="cos",
@@ -262,6 +274,13 @@ def train(
 
                     generated = model.generate(code, max_new_tokens=64)
                     print(f"  Generated: {generated[:80]}...")
+
+                    # Projector variance diagnostic
+                    with torch.no_grad():
+                        projected = model(code)  # [M+1, D]
+                        proj_var = projected.var(dim=0).mean().item()
+                        proj_norm = projected.norm(dim=-1).mean().item()
+                    print(f"  proj_var={proj_var:.6f}  proj_norm={proj_norm:.4f}")
                     print()
 
                     model.train()
@@ -323,10 +342,12 @@ def train(
     print("=" * 60)
 
     model.eval()
-    test_dataset = MatlabPseudocodeDataset(split="test", model_type=model_type)
+    test_dataset = MatlabPseudocodeDataset(split="train[-20%:]", model_type=model_type)
     smoother = SmoothingFunction().method1
     bleu_scores = []
     efficiency_metrics = []
+    proj_vars = []
+    proj_norms = []
 
     for i, sample in enumerate(test_dataset):
         code = sample['code']
@@ -339,6 +360,14 @@ def train(
             print(f"  [sample {i}] generation failed: {e}")
             continue
 
+        # Projector variance diagnostic per sample
+        with torch.no_grad():
+            projected = model(code)  # [M+1, D]
+            pv = projected.var(dim=0).mean().item()
+            pn = projected.norm(dim=-1).mean().item()
+        proj_vars.append(pv)
+        proj_norms.append(pn)
+
         ref_tokens = reference.split()
         gen_tokens = generated.split()
         score = sentence_bleu(
@@ -348,7 +377,7 @@ def train(
         efficiency_metrics.append(eff)
 
         if i < 5:
-            print(f"  Sample {i}: BLEU={score:.4f}")
+            print(f"  Sample {i}: BLEU={score:.4f}  proj_var={pv:.6f}  proj_norm={pn:.4f}")
             print(f"    ref:  {reference[:80]}...")
             print(f"    gen:  {generated[:80]}...")
             print(f"    encode={eff.get('encode_time_s',0):.3f}s  "
@@ -357,7 +386,10 @@ def train(
                   f"kv_cache={eff.get('kv_cache_mb',0):.1f}MB")
 
     avg_bleu = sum(bleu_scores) / len(bleu_scores) if bleu_scores else 0.0
+    avg_proj_var = sum(proj_vars) / len(proj_vars) if proj_vars else 0.0
+    avg_proj_norm = sum(proj_norms) / len(proj_norms) if proj_norms else 0.0
     print(f"\nAverage BLEU ({len(bleu_scores)} samples): {avg_bleu:.4f}")
+    print(f"Average proj_var: {avg_proj_var:.6f}  proj_norm: {avg_proj_norm:.4f}")
 
     # Efficiency summary
     if efficiency_metrics:
@@ -372,6 +404,8 @@ def train(
         print(f"  Avg tokens/sec:     {avg_key('tokens_per_sec'):.1f}")
         print(f"  Avg KV cache:       {avg_key('kv_cache_mb'):.2f} MB")
         print(f"  Avg peak VRAM:      {avg_key('peak_vram_mb'):.1f} MB")
+        print(f"  Avg proj_var:       {avg_proj_var:.6f}")
+        print(f"  Avg proj_norm:      {avg_proj_norm:.4f}")
 
     # ==================================================================
     # SAVE GRAPHS
@@ -418,6 +452,10 @@ def train(
         "epochs": epochs,
         "model_type": model_type,
         "efficiency": efficiency_metrics,
+        "avg_proj_var": avg_proj_var,
+        "avg_proj_norm": avg_proj_norm,
+        "proj_vars": proj_vars,
+        "proj_norms": proj_norms,
     }
     with open(save_path / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
@@ -461,6 +499,7 @@ if __name__ == "__main__":
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument("--lora_layers", type=int, default=6, help="Number of last Qwen layers to apply LoRA")
+    parser.add_argument("--lora_lr", type=float, default=1e-4, help="Separate LR for LoRA params (lower than base)")
 
     # Resume
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
@@ -486,5 +525,6 @@ if __name__ == "__main__":
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         lora_layers=args.lora_layers,
+        lora_lr=args.lora_lr,
         resume=args.resume,
     )
