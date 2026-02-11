@@ -5,10 +5,10 @@ Combined Semantic ViT - Dual pathway model
 Fuses both ViT (sequential) and RvNN (structural) paths:
 
     Code -> CodeBERT -> PixelEmbedder
-        ├── PatchEmbedder -> Projector       -> [M, 1536]  (ViT path)
-        └── PixelAdapter  -> RecursiveEncoder -> [1, 1536]  (Tree path)
+        ├── PatchEmbedder -> Projector       -> [M, qwen_dim]  (ViT path)
+        └── PixelAdapter  -> RecursiveEncoder -> [1, qwen_dim]  (Tree path)
                             ↓
-                 cat([global, seq]) -> [M+1, 1536]
+                 cat([global, seq]) -> [M+1, qwen_dim]
                             ↓
                        QwenDecoder
 """
@@ -62,31 +62,32 @@ class CombinedSemanticViT(nn.Module):
             num_types=NUM_TYPES
         ).to(DEVICE)
 
+        # --- DECODER (created first so we can read hidden_size) ---
+        self.decoder = QwenDecoder(device=DEVICE)
+        qwen_dim = self.decoder.hidden_size
+
         # --- PATH 1: SEQUENTIAL (ViT) ---
         self.patch_embedder = PatchEmbedder(patch_size=patch_size)
         self.projector = Projector(
             in_dim=patch_size * 768,
             bottleneck_dim=bottleneck_dim,
-            out_dim=1536,
+            out_dim=qwen_dim,
             dropout=dropout
         ).to(DEVICE)
 
         # --- PATH 2: STRUCTURAL (RvNN) ---
         self.pixel_adapter = nn.Sequential(
-            nn.Linear(768, 1536),
-            nn.LayerNorm(1536),
+            nn.Linear(768, qwen_dim),
+            nn.LayerNorm(qwen_dim),
             nn.GELU()
         ).to(DEVICE)
 
         self.recursive_encoder = RecursiveEncoder(
-            embed_dim=1536,
+            embed_dim=qwen_dim,
             max_branching=8,
-            hidden_dim=3072,
+            hidden_dim=qwen_dim * 2,
             dropout=dropout
         ).to(DEVICE)
-
-        # --- DECODER ---
-        self.decoder = QwenDecoder(device=DEVICE)
 
     def get_trainable_parameters(self):
         """Return all trainable parameters from both paths."""
@@ -140,12 +141,12 @@ class CombinedSemanticViT(nn.Module):
         pixel_embeddings = self.pixel_embedder(cls_embeddings, depth_ids, type_ids)
 
         # --- PATH 1: Sequential ---
-        # [N, 768] -> [M, 3072] -> [M, 1536]
+        # [N, 768] -> [M, patch*768] -> [M, qwen_dim]
         patch_embeddings = self.patch_embedder(pixel_embeddings)
         seq_vectors = self.projector(patch_embeddings)
 
         # --- PATH 2: Structural ---
-        # [N, 768] -> [1, N, 1536] -> [1, 1536]
+        # [N, 768] -> [1, N, qwen_dim] -> [1, qwen_dim]
         pixels_for_tree = self.pixel_adapter(pixel_embeddings).unsqueeze(0)
         global_vector = self.recursive_encoder.forward_tree(
             features['tree_roots'],
@@ -153,7 +154,7 @@ class CombinedSemanticViT(nn.Module):
         )
 
         # --- FUSION ---
-        # [1, 1536] + [M, 1536] -> [M+1, 1536]
+        # [1, qwen_dim] + [M, qwen_dim] -> [M+1, qwen_dim]
         combined = torch.cat([global_vector, seq_vectors], dim=0)
 
         # --- DECODE ---

@@ -85,6 +85,7 @@ def train(
     lora_dropout: float = 0.05,
     lora_layers: int = 6,
     lora_lr: float = 1e-4,
+    eval_samples: int = 50,
     resume: str = None,
 ):
     """Main training function."""
@@ -350,6 +351,9 @@ def train(
     proj_norms = []
 
     for i, sample in enumerate(test_dataset):
+        if i >= eval_samples:
+            break
+
         code = sample['code']
         reference = sample['target']
         features = sample.get('features')
@@ -500,6 +504,7 @@ if __name__ == "__main__":
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument("--lora_layers", type=int, default=6, help="Number of last Qwen layers to apply LoRA")
     parser.add_argument("--lora_lr", type=float, default=1e-4, help="Separate LR for LoRA params (lower than base)")
+    parser.add_argument("--eval_samples", type=int, default=50, help="Number of samples for BLEU eval")
 
     # Resume
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
@@ -526,5 +531,6 @@ if __name__ == "__main__":
         lora_dropout=args.lora_dropout,
         lora_layers=args.lora_layers,
         lora_lr=args.lora_lr,
+        eval_samples=args.eval_samples,
         resume=args.resume,
     )

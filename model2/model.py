@@ -46,23 +46,24 @@ class StructuralModel(nn.Module):
             num_types=NUM_TYPES
         ).to(DEVICE)
 
-        # Adapt pixel (768) to Recursive dim (1536)
+        # Decoder (created first so we can read hidden_size)
+        self.decoder = QwenDecoder(device=DEVICE)
+        qwen_dim = self.decoder.hidden_size
+
+        # Adapt pixel (768) to Recursive dim
         self.pixel_adapter = nn.Sequential(
-            nn.Linear(768, 1536),
-            nn.LayerNorm(1536),
+            nn.Linear(768, qwen_dim),
+            nn.LayerNorm(qwen_dim),
             nn.GELU()
         ).to(DEVICE)
 
         # Recursive Encoder (tree aggregation)
         self.recursive_encoder = RecursiveEncoder(
-            embed_dim=1536,
+            embed_dim=qwen_dim,
             max_branching=8,
-            hidden_dim=3072,
+            hidden_dim=qwen_dim * 2,
             dropout=dropout
         ).to(DEVICE)
-
-        # Decoder (frozen)
-        self.decoder = QwenDecoder(device=DEVICE)
 
     def get_trainable_parameters(self):
         """Return only trainable parameters for optimizer."""
@@ -110,10 +111,10 @@ class StructuralModel(nn.Module):
         # 3. Pixel Embeddings [N, 768]
         pixel_embeddings = self.pixel_embedder(cls_embeddings, depth_ids, type_ids)
 
-        # 4. Adapt for tree: [N, 768] -> [1, N, 1536]
+        # 4. Adapt for tree: [N, 768] -> [1, N, qwen_dim]
         pixels_for_tree = self.pixel_adapter(pixel_embeddings).unsqueeze(0)
 
-        # 5. Recursive tree traversal -> [1, 1536]
+        # 5. Recursive tree traversal -> [1, qwen_dim]
         global_vector = self.recursive_encoder.forward_tree(
             features['tree_roots'],
             pixels_for_tree

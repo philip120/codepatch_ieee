@@ -31,7 +31,7 @@ class QwenDecoder:
         - Generates text autoregressively
     """
 
-    def __init__(self, model_name: str = "Qwen/Qwen2-1.5B", device: str = None):
+    def __init__(self, model_name: str = "Qwen/Qwen3-4B-Instruct-2507", device: str = None):
         self.device = device or DEVICE
 
         print(f"Loading {model_name}...")
@@ -42,6 +42,7 @@ class QwenDecoder:
         )
         self.model.to(self.device)
         self.model.eval()
+        self.hidden_size = self.model.config.hidden_size
 
         # Set pad token
         if self.tokenizer.pad_token is None:
@@ -57,7 +58,7 @@ class QwenDecoder:
 
     def enable_lora(self, rank: int = 16, alpha: int = 32, dropout: float = 0.05, num_layers: int = 6):
         """Apply LoRA adapters to the last `num_layers` Qwen layers."""
-        total_layers = self.model.config.num_hidden_layers  # 28 for Qwen2-1.5B
+        total_layers = self.model.config.num_hidden_layers  # 36 for Qwen3-4B
         target_layers = list(range(total_layers - num_layers, total_layers))
         target_modules = [
             f"model.layers.{i}.self_attn.{proj}"
@@ -287,7 +288,7 @@ if __name__ == "__main__":
 
     # Fake projected embeddings (normally from Projector)
     num_patches = 3
-    projected = torch.randn(num_patches, 1536, device=DEVICE)
+    projected = torch.randn(num_patches, decoder.hidden_size, device=DEVICE)
 
     print(f"\n  Input projected: {projected.shape}")
 

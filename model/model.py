@@ -52,16 +52,17 @@ class SemanticViT(nn.Module):
         # Patch embedder
         self.patch_embedder = PatchEmbedder(patch_size=patch_size)
 
+        # Qwen decoder (frozen, not nn.Module — created before projector to read hidden_size)
+        self.decoder = QwenDecoder(device=DEVICE)
+        qwen_dim = self.decoder.hidden_size
+
         # Projector (TRAINABLE)
         self.projector = Projector(
             in_dim=patch_size * 768,
             bottleneck_dim=bottleneck_dim,
-            out_dim=1536,
+            out_dim=qwen_dim,
             dropout=dropout,
         ).to(DEVICE)
-
-        # Qwen decoder (frozen, not nn.Module)
-        self.decoder = QwenDecoder(device=DEVICE)
 
     def get_trainable_parameters(self):
         """Return only trainable parameters for optimizer."""
@@ -110,7 +111,7 @@ class SemanticViT(nn.Module):
         # 4. Patch embeddings [M, 3072]
         patch_embeddings = self.patch_embedder(pixel_embeddings)
 
-        # 5. Project to Qwen space [M, 1536]
+        # 5. Project to Qwen space [M, qwen_dim]
         projected = self.projector(patch_embeddings)
 
         # 6. Decode

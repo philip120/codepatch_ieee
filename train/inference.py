@@ -60,16 +60,17 @@ class SemanticViTInference:
         # Step 4: Patch embedder
         self.patch_embedder = PatchEmbedder(patch_size=patch_size)
 
-        # Step 5: Projector
+        # Step 5: Qwen decoder (created before projector to read hidden_size)
+        self.decoder = QwenDecoder(device=DEVICE)
+        qwen_dim = self.decoder.hidden_size
+
+        # Step 6: Projector
         self.projector = Projector(
             in_dim=patch_size * 768,
             bottleneck_dim=bottleneck_dim,
-            out_dim=1536,
+            out_dim=qwen_dim,
             dropout=0.0,  # No dropout during inference
         ).to(DEVICE)
-
-        # Step 6: Qwen decoder
-        self.decoder = QwenDecoder(device=DEVICE)
 
         # Load checkpoint
         print(f"\nLoading checkpoint: {checkpoint_path}")

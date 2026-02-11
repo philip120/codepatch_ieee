@@ -29,7 +29,7 @@ class Projector(nn.Module):
         self,
         in_dim: int = 3072,        # patch_size * 768
         bottleneck_dim: int = 512,  # compression layer
-        out_dim: int = 1536,        # Qwen embedding dim
+        out_dim: int = 2560,        # Qwen embedding dim
         dropout: float = 0.4,       # aggressive for small data
     ):
         super().__init__()
