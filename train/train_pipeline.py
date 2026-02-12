@@ -203,10 +203,11 @@ def train(
         if 'optimizer' in ckpt:
             optimizer.load_state_dict(ckpt['optimizer'])
         if 'scheduler' in ckpt:
-            try:
+            ckpt_total = ckpt['scheduler'].get('total_steps', total_steps)
+            if ckpt_total == total_steps:
                 scheduler.load_state_dict(ckpt['scheduler'])
-            except Exception:
-                print("  Scheduler state incompatible (total_steps changed), using fresh scheduler")
+            else:
+                print(f"  Scheduler reset (checkpoint had {ckpt_total} total steps, now {total_steps})")
         if 'scaler' in ckpt and use_amp:
             scaler.load_state_dict(ckpt['scaler'])
 
