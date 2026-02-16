@@ -6,7 +6,7 @@
 This module handles AST parsing to extract texts, depths, type IDs, and tree roots from MATLAB code.
 
 ### Data Structure: TreeNode
-* **Base Class:** Inherits properties from `SemanticNode`.
+* **Composition:** Wraps a `SemanticNode` instance (`self.node`) rather than inheriting from it.
 * **index:** Represents the original position in the list.
 * **children:** A list of pointers to other `TreeNode` objects.
 
@@ -40,13 +40,30 @@ This module handles AST parsing to extract texts, depths, type IDs, and tree roo
 
 ---
 
-## 2. CodeBERT Encoder
+## 2. CodeBERT Encoder (`shared/codebert_encoder.py`)
 * **Status:** Frozen.
-* **Function:** Converts semantic "pixels" directly into embeddings.
+* **Function:** Converts raw text strings (one per semantic operation) into `[N, 768]` CLS embeddings using the pre-trained CodeBERT model. Operates before the Pixel Embedder.
 
 ---
 
-## 3. Patch Embedder (`shared/patch_embedder.py`)
+## 3. Pixel Embedder (`shared/pixel_embedder.py`)
+Adds learnable structural metadata to each CodeBERT embedding via element-wise addition.
+
+### Trainable Embeddings
+* **Depth Embedding:** `nn.Embedding(16, 768)` — encodes AST nesting depth (e.g., top-level=0, nested if=1).
+* **Type Embedding:** `nn.Embedding(16, 768)` — encodes semantic node type (e.g., assignment, loop, conditional).
+* Both initialized with small normal noise (`std=0.02`) so they don't dominate the CLS signal early in training.
+
+### Forward Pass
+```python
+pixel = CLS_embedding + depth_embedding(depth_id) + type_embedding(type_id)
+```
+* **Input:** `[N, 768]` CLS embeddings, `[N]` depth indices, `[N]` type indices.
+* **Output:** `[N, 768]` pixel embeddings enriched with structural position and type information.
+
+---
+
+## 4. Patch Embedder (`shared/patch_embedder.py`)
 A utility module inspired by the Vision Transformer (ViT) architecture. It groups fine-grained code "pixel" embeddings into larger "patches" to reduce sequence lengths for the decoder.
 
 ### The ViT for Code Concept
@@ -78,7 +95,7 @@ flat_patches = patches.view(num_patches, P * D)
 
 ---
 
-## 4. MLP Model 1 (Projector)
+## 5. MLP Model 1 (Projector) (`shared/projector.py`)
 This module uses a two-stage transformation to compress and translate CodeBERT features into pseudo-tokens the LLM can understand, preventing rote memorization.
 
 ### Stage 1: Compression (Bottleneck)
@@ -87,26 +104,26 @@ This module uses a two-stage transformation to compress and translate CodeBERT f
 * **Regularization:** Uses LayerNorm for stability, GELU for non-linearity, and an aggressive Dropout (0.4) to prevent overfitting.
 
 ### Stage 2: Expansion
-* **Transformation:** A second Linear layer expands the bottleneck features up to 2560 (matching the Qwen-0.5B embedding dimension).
+* **Transformation:** A second Linear layer expands the bottleneck features up to 2560 (matching the Qwen3-4B-Instruct embedding dimension).
 * **Final LayerNorm:** Ensures output vectors are scaled appropriately before injection.
 
 ### Training Parameters
 * **in_dim (3072):** Fixed based on patch size and CodeBERT constraints.
 * **bottleneck_dim (512):** Tunable hyperparameter for compression intensity.
-* **out_dim (2560):** Hard-coded to match the decoder.
+* **out_dim (2560):** Read dynamically from `decoder.hidden_size` to match the decoder.
 * **Gradient Flow:** Fully trainable; learns to map code features into LLM-compatible embeddings via backpropagation.
 
 ---
 
-## 5. Recursive Encoder (Model 2 MLP)
+## 6. Recursive Encoder (Model 2 MLP) (`model2/recursive_encoder.py`)
 Processes data bottom-up using recursive neural logic.
 
 ### Components
 * **Child Aggregator (MLP):** Distills up to 8 children's embeddings into a single summary vector.
-    *   **Concatenation-based Aggregation:** Instead of summing or averaging, the model concatenates up to 8 children into a "Super-Vector" of dimension \(8 \times 1536 = 12,288\). This allows the model to learn **order-sensitive** logic (e.g., distinguishing between the first and last child in a block).
-    *   **Distillation:** A two-layer MLP (Linear → LayerNorm → GELU → Dropout → Linear) compresses this large vector back down to the model dimension (1536), distilling the structural context.
+    *   **Concatenation-based Aggregation:** Instead of summing or averaging, the model concatenates up to 8 children into a "Super-Vector" of dimension \(8 \times 2560 = 20{,}480\). This allows the model to learn **order-sensitive** logic (e.g., distinguishing between the first and last child in a block).
+    *   **Distillation:** A two-layer MLP (Linear → LayerNorm → GELU → Dropout → Linear) compresses this large vector back down to the model dimension (2560), distilling the structural context.
     *   **Padding:** Nodes with fewer than 8 children are zero-padded to maintain a fixed-width input window for the MLP.
-* **Combiner (Linear Layer):** Merges a parent's own semantic meaning (e.g., "This is an if header") with the distilled summary of its children. It concatenates the parent vector and the child summary (\(2 \times 1536\)) and projects them back to 1536.
+* **Combiner (Linear + LayerNorm):** Merges a parent's own semantic meaning (e.g., "This is an if header") with the distilled summary of its children. It concatenates the parent vector and the child summary (\(2 \times 2560\)) and projects them back to 2560, followed by LayerNorm.
 
 ### Recursive Logic (`forward_tree`)
 * **Base Case:** Leaf nodes return their own embedding.
@@ -116,7 +133,7 @@ Processes data bottom-up using recursive neural logic.
 
 ---
 
-## 6. Qwen Decoder
+## 7. Qwen Decoder (`shared/qwen_decoder.py`)
 Handles autoregressive generation and specific loss masking for fine-tuning.
 
 ### Concatenation Logic (`forward_train`)
@@ -145,12 +162,12 @@ labels = torch.cat([patch_labels, prompt_labels, target_labels], dim=1)
 
 ---
 
-## 7. Combined Model (`combined_model/model.py`)
+## 8. Combined Model (`combined_model/model.py`)
 * **Purpose:** The central wrapper that links the extractors, encoders, patch embedders, and the decoder into a single runnable architecture.
 
 ---
 
-## 8. Train Pipeline (`train/train_pipeline.py`)
+## 9. Train Pipeline (`train/train_pipeline.py`)
 The main coordination script managing data loading, initialization, loops, and evaluation across all model types.
 
 ### Key Features
@@ -169,7 +186,7 @@ The main coordination script managing data loading, initialization, loops, and e
 
 ---
 
-## 9. Training Dynamics
+## 10. Training Dynamics
 
 ### Optimizer & Regularization
 *   **Optimizer:** The model uses **AdamW** (Adam with Weight Decay) to optimize the trainable parameters.
@@ -185,10 +202,10 @@ Where \( X_{code} \) represents the projected patches and prompt, which are **ma
 
 ### Hyperparameters
 *   **Peak Learning Rates:**
-    *   **Base Params** (Projector, RvNN, etc.): `1e-4`
+    *   **Base Params** (Projector, RvNN, etc.): `3e-4`
     *   **LoRA Params** (LLM Adapters): `1e-4` (tunable independently).
 *   **Effective Batch Size:**
     *   **Batch Size:** 1
-    *   **Gradient Accumulation:** 2
-    *   **Effective Batch Size:** **2** (allows training large LLM decoders on memory-constrained hardware).
+    *   **Gradient Accumulation:** 8
+    *   **Effective Batch Size:** **8** (allows training large LLM decoders on memory-constrained hardware).
 *   **Mixed Precision:** Training uses **Automatic Mixed Precision (AMP)** with `float16` on CUDA devices to reduce VRAM footprint and increase throughput.
