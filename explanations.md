@@ -196,9 +196,6 @@ The main coordination script managing data loading, initialization, loops, and e
 ### Loss Function
 The model is trained using **Next-Token Prediction** (Cross-Entropy Loss). Since the input is a hybrid of projected code patches and text, a **label mask** is applied to ensure the model only learns to generate the pseudocode.
 
-**Formal Definition:**
-$$L = - \sum_{t=1}^{T} \log P(y_t \mid y_{<t}, X_{code})$$
-Where $X_{code}$ represents the projected patches and prompt, which are **masked out** (labels set to -100) so they do not contribute to the gradient calculation.
 
 ### Hyperparameters
 *   **Peak Learning Rates:**
