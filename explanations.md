@@ -136,29 +136,98 @@ Processes data bottom-up using recursive neural logic.
 ## 7. Qwen Decoder (`shared/qwen_decoder.py`)
 Handles autoregressive generation and specific loss masking for fine-tuning.
 
-### Concatenation Logic (`forward_train`)
-Constructs a single sequence ordering for the model:
-1.  Projected Patches (MATLAB code)
-2.  Prompt Embeddings (Instructions)
-3.  Target Embeddings (Ground-truth pseudocode)
+### Notation
+* **N:** Number of semantic operations extracted from the MATLAB source code.
+* **M:** Number of patches after grouping N pixels with patch size P (`M = ceil(N / P)`). With the RvNN global vector prepended, the code occupies `M+1` positions.
+* **P:** Number of prompt tokens (from Qwen's tokenizer applied to the task prompt string).
+* **T:** Number of target tokens (from Qwen's tokenizer applied to the ground-truth pseudocode).
+* **D:** Qwen hidden dimension (2560 for Qwen3-4B-Instruct).
 
-### Label Masking
-Uses a special `-100` index in PyTorch to force the CrossEntropyLoss function to ignore patches and prompts. This ensures the model only calculates gradients based on pseudocode prediction.
+### Step 1: Encode MATLAB Code (Trainable Pipeline)
+
+```
+MATLAB code
+  → SemanticExtractor: parse into N semantic operations
+  → CodeBERT (frozen): [N, 768] CLS embeddings
+  → PixelEmbedder: + depth/type → [N, 768]
+  → PatchEmbedder: group into patches → [M, patch_size * 768]
+  → Projector: bottleneck MLP → [M, D]
+  → RvNN: tree aggregation → [1, D]
+  → Concatenate: [M+1, D]   ← these are the "pseudo-tokens"
+```
+
+### Step 2: Build the Input Sequence (`forward_train`)
+
+The pseudocode target (e.g. `"1. Check if x is positive\n2. Double it"`) is tokenized by Qwen's tokenizer into token IDs, then converted to Qwen's own embeddings via its embedding table. Three segments are concatenated along the sequence dimension:
+
+```
+Position:  [0 ... M]            [M+1 ... M+P]         [M+P+1 ... M+P+T]
+Content:   code pseudo-tokens    prompt embeddings      target text embeddings
+Source:    our projector/RvNN    Qwen embed table       Qwen embed table
+Shape:     [1, M+1, D]          [1, P, D]              [1, T, D]
+
+Full input_embeds: [1, M+1+P+T, D]
+```
+
+### Step 3: Build the Labels (Masking)
+
+```
+Position:  [0 ... M]   [M+1 ... M+P]   [M+P+1 ... M+P+T]
+Labels:    [-100 ...]   [-100 ...]       [token_id_1, token_id_2, ..., token_id_T]
+```
+
+`-100` is PyTorch's ignore index for `CrossEntropyLoss`. Only the T pseudocode token positions contribute to the loss.
 
 ```python
-# -100 = ignore (don't compute loss on patches or prompt)
-patch_labels = torch.full((1, num_patches), -100, ...)
+patch_labels  = torch.full((1, num_patches), -100, ...)
 prompt_labels = torch.full((1, num_prompt), -100, ...)
 target_labels = target_tokens.input_ids.clone()
 labels = torch.cat([patch_labels, prompt_labels, target_labels], dim=1)
 ```
 
+### Step 4: Forward Through Qwen
+
+Qwen processes the full sequence with **causal attention** (each position can only attend to itself and earlier positions). At every position `i`, it outputs a probability distribution over the entire vocabulary (~150K tokens):
+
+```
+logits: [1, M+1+P+T, vocab_size]
+```
+
+### Step 5: Compute Cross-Entropy Loss
+
+The loss is computed with a **shift-by-one**: the model's prediction at position `t-1` is compared against the actual token at position `t`. This is standard causal LM next-token prediction.
+
+```
+Position M+P+1: model sees [code + prompt]                 → should predict token_id_1
+Position M+P+2: model sees [code + prompt + token_1]       → should predict token_id_2
+Position M+P+3: model sees [code + prompt + tok_1 + tok_2] → should predict token_id_3
+...
+```
+
+At each position, the loss is:
+
+\[ L_t = -\log P(y_t \mid y_{<t},\; X_{\text{code}},\; X_{\text{prompt}}) \]
+
+Where \( P(y_t \mid \ldots) \) is the softmax probability Qwen assigned to the correct token.
+
+### Step 6: Final Loss
+
+Averaged over all T target positions:
+
+\[ L = \frac{1}{T} \sum_{t=1}^{T} -\log P(y_t \mid y_{<t},\; X_{\text{code}},\; X_{\text{prompt}}) \]
+
+The pseudocode is **never encoded into a latent representation**. It is tokenized into discrete IDs and used as classification targets. The model learns: given these code embeddings as context, generate the correct pseudocode tokens.
+
 ### Backpropagation Chain
-* **Loss Origin:** Calculated at the final output head of the Qwen decoder.
-* **Decoder Path:** Gradients update LoRA matrices; frozen Qwen weights pass gradients through without updating.
-* **The Bridge:** Gradients flow back into the Projector/RvNN.
-* **Encoder Path:** The Projector, Recursive Encoder, and PixelEmbedder receive full backpropagation to learn structural representations.
-* **Termination:** Halts at the frozen CodeBERT encoder.
+
+This single scalar loss backpropagates through:
+
+1. **Qwen's output head** → loss origin.
+2. **Qwen's LoRA weights** → gradients update the adapter matrices.
+3. **Qwen's frozen weights** → gradients pass through without updating (computation graph is preserved).
+4. **The projected code pseudo-tokens** at positions `0...M` → gradients flow into the input embeddings.
+5. **Projector, RvNN, PixelEmbedder** → all trainable weights update via backpropagation.
+6. **CodeBERT (frozen)** → gradient flow terminates here.
 
 ---
 
@@ -194,8 +263,7 @@ The main coordination script managing data loading, initialization, loops, and e
 *   **Learning Rate Scheduler:** A **OneCycleLR** scheduler is used, which implements a warmup period followed by a cosine decay to zero.
 
 ### Loss Function
-The model is trained using **Next-Token Prediction** (Cross-Entropy Loss). Since the input is a hybrid of projected code patches and text, a **label mask** is applied to ensure the model only learns to generate the pseudocode.
-
+See Section 7 (Qwen Decoder) for the full loss computation walkthrough.
 
 ### Hyperparameters
 *   **Peak Learning Rates:**
