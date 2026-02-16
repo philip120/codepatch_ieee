@@ -206,15 +206,15 @@ Position M+P+3: model sees [code + prompt + tok_1 + tok_2] → should predict to
 
 At each position, the loss is:
 
-\[ L_t = -\log P(y_t \mid y_{<t},\; X_{\text{code}},\; X_{\text{prompt}}) \]
+$$ L_t = -\log P(y_t \mid y_{<t},\; X_{\text{code}},\; X_{\text{prompt}}) $$
 
-Where \( P(y_t \mid \ldots) \) is the softmax probability Qwen assigned to the correct token.
+Where $P(y_t \mid \ldots)$ is the softmax probability Qwen assigned to the correct token.
 
 ### Step 6: Final Loss
 
-Averaged over all T target positions:
+Averaged over all $T$ target positions:
 
-\[ L = \frac{1}{T} \sum_{t=1}^{T} -\log P(y_t \mid y_{<t},\; X_{\text{code}},\; X_{\text{prompt}}) \]
+$$ L = \frac{1}{T} \sum_{t=1}^{T} -\log P(y_t \mid y_{<t},\; X_{\text{code}},\; X_{\text{prompt}}) $$
 
 The pseudocode is **never encoded into a latent representation**. It is tokenized into discrete IDs and used as classification targets. The model learns: given these code embeddings as context, generate the correct pseudocode tokens.
 
