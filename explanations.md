@@ -287,45 +287,239 @@ This single scalar loss backpropagates through:
 ---
 
 ## 8. Combined Model (`combined_model/model.py`)
-* **Purpose:** The central wrapper that links the extractors, encoders, patch embedders, and the decoder into a single runnable architecture.
+The central wrapper that fuses both encoding paths and feeds the result to the decoder.
+
+### Dual-Path Fusion Strategy
+The model encodes MATLAB code through two independent paths that capture complementary information:
+
+* **ViT Path (Sequential):** PatchEmbedder → Projector → `[M, D]`. Captures the linear reading order of the code — which operations come before or after others. Analogous to reading code line by line.
+* **Tree Path (Structural):** PixelAdapter → RecursiveEncoder → `[1, D]`. Captures the hierarchical nesting — which operations are inside loops, conditionals, or function scopes. Analogous to understanding the control flow graph.
+
+### Concatenation
+The two path outputs are concatenated along the sequence dimension:
+
+```
+combined = cat([global_vector, seq_vectors], dim=0)
+         = cat([1, D] , [M, D]) → [M+1, D]
+```
+
+The RvNN global vector is **prepended** (position 0), so it serves as a structural summary token that Qwen attends over first. The M sequential tokens follow, providing fine-grained local context.
+
+### Why Concatenation (Not Addition)
+Adding the vectors would force both paths to share the same positions and collapse structural and sequential information into one signal per position. Concatenation preserves both signals as separate tokens, letting Qwen's attention mechanism decide how to weight them at each decoding step.
 
 ---
 
-## 9. Train Pipeline (`train/train_pipeline.py`)
-The main coordination script managing data loading, initialization, loops, and evaluation across all model types.
+## 9. The "Pixel" Metaphor
+
+### ViT for Code
+The architecture borrows its core abstraction from the **Vision Transformer (ViT)**. In a standard ViT, an image is split into a grid of patches, each patch is flattened and projected into the transformer's embedding space, and the transformer processes them as a sequence of tokens.
+
+This project applies the same logic to source code:
+
+| ViT (Images)               | This Project (Code)                     |
+|----------------------------|-----------------------------------------|
+| Raw image (H x W x 3)     | Raw MATLAB source code                  |
+| Image pixels               | Semantic operations (AST nodes)         |
+| Patch (16x16 pixel block)  | Group of adjacent operations            |
+| Patch projection (Linear)  | Projector (Bottleneck MLP)              |
+| ViT Transformer encoder    | Qwen decoder (causal attention)         |
+
+### Why "Pixel"
+Each semantic operation extracted from the AST is called a "pixel" because it is the smallest indivisible unit of the code representation — analogous to a pixel being the smallest unit of an image. The PixelEmbedder enriches each pixel with structural metadata (depth, type), just as positional embeddings in ViT encode spatial location.
+
+### Why This Analogy Works
+Code has both **local patterns** (adjacent lines often relate) and **global structure** (a return statement only makes sense in the context of the entire function). ViT's patch-based approach captures local patterns via concatenation within patches, while the transformer's attention captures global dependencies. The addition of the RvNN path adds explicit hierarchical structure that ViT cannot capture on its own.
+
+---
+
+## 10. Model Variants (Ablation)
+
+Three model variants exist to isolate the contribution of each encoding path:
+
+### Model 1: ViT-Only (`model/model.py` — `SemanticViT`)
+* **Path:** PixelEmbedder → PatchEmbedder → Projector → QwenDecoder
+* **Output:** `[M, D]` — only sequential patch tokens, no tree information.
+* **Purpose:** Baseline to measure how well sequential reading order alone can drive pseudocode generation.
+
+### Model 2: Tree-Only (`model2/model.py` — `StructuralModel`)
+* **Path:** PixelEmbedder → PixelAdapter → RecursiveEncoder → QwenDecoder
+* **Output:** `[1, D]` — a single global vector from tree aggregation.
+* **Purpose:** Baseline to measure how well hierarchical structure alone can drive generation. Only one token is fed to Qwen, so all code information must be compressed into a single vector.
+
+### Model 3: Combined (`combined_model/model.py` — `CombinedSemanticViT`)
+* **Path:** Both paths run in parallel, outputs concatenated.
+* **Output:** `[M+1, D]` — sequential tokens + structural global token.
+* **Purpose:** The full model. Comparing against Models 1 and 2 reveals whether fusion helps and what each path contributes.
+
+### Ablation Framing
+Comparing the three variants answers:
+* **Combined vs ViT-Only:** Does adding tree structure improve generation?
+* **Combined vs Tree-Only:** Does adding sequential context improve generation?
+* **ViT-Only vs Tree-Only:** Which signal is more valuable on its own?
+
+---
+
+## 11. LoRA (Low-Rank Adaptation)
+
+### Why LoRA
+Qwen3-4B has ~4 billion parameters. Fine-tuning all of them would require far more VRAM and data than available. LoRA freezes the base weights and injects small trainable matrices into specific attention layers, enabling the decoder to adapt to the code-to-pseudocode task with minimal parameters.
+
+### How It Works
+For a frozen weight matrix `W` of shape `[d, d]`, LoRA adds a low-rank decomposition:
+
+```
+output = W @ x + (B @ A) @ x
+```
+
+Where `A` is `[r, d]` and `B` is `[d, r]` with rank `r` much smaller than `d`. Only `A` and `B` are trained. This adds `2 * r * d` parameters per adapted layer instead of `d * d`.
+
+### Configuration
+* **Target Modules:** `q_proj` and `v_proj` in each attention layer. These are the query and value projections — adapting them lets the model change *what it attends to* and *what information it extracts*, which is sufficient for task adaptation. `k_proj` and `o_proj` are left frozen.
+* **Target Layers:** Last 12 of 36 layers (`layers[24..35]`). Earlier layers capture general language features and are left untouched. Later layers handle task-specific generation and benefit most from adaptation.
+* **Rank (r=16):** Controls the expressiveness of the low-rank update. Higher rank = more capacity but more parameters.
+* **Alpha (alpha=128):** Scaling factor applied to the LoRA output. The effective update is scaled by `alpha / rank = 128 / 16 = 8x`, amplifying the LoRA signal.
+* **Dropout (0.05):** Applied to LoRA layers to regularize the small adapter.
+* **Total LoRA Parameters:** ~2M (12 layers x 2 projections x 2 matrices x rank 16 x dim 2560).
+
+### Dual Learning Rate
+LoRA parameters use a separate, lower learning rate (`1e-4`) than the base trainable modules (`3e-4`). This prevents the adapted decoder from changing too aggressively, preserving Qwen's pre-trained language generation ability while still learning to interpret the code pseudo-tokens.
+
+---
+
+## 12. Training vs Inference
+
+### Training (Teacher Forcing)
+During training, the model sees the **entire ground truth pseudocode** as input. At each position, it predicts the next token, but the input at every position is always the correct token — never the model's own prediction. All T positions are evaluated in a **single forward pass** (no sequential generation loop).
+
+**Advantage:** Fast and stable. The model always trains on correct context.
+
+**Disadvantage:** Exposure bias — during training, the model never encounters its own mistakes. At inference time, one wrong prediction shifts the context into territory never seen during training, potentially causing error accumulation.
+
+### Inference (Autoregressive Generation)
+During inference, the model generates one token at a time. Each predicted token is appended to the sequence and fed back as input for the next step. This continues until an end-of-sequence token is produced or `max_new_tokens` is reached.
+
+```
+Step 1: [code tokens + prompt]            → predict "check"
+Step 2: [code tokens + prompt + "check"]  → predict "if"
+Step 3: [... + "check" + "if"]            → predict "x"
+...
+```
+
+**Sampling parameters:**
+* **Temperature (0.7):** Controls randomness. Lower = more deterministic, higher = more diverse.
+* **Top-p / Nucleus Sampling (0.9):** Only samples from the smallest set of tokens whose cumulative probability exceeds 0.9, filtering out low-probability noise.
+
+---
+
+## 13. Dataset
+
+### Source
+`philip120/matlab-nl-pseudocode-v2` hosted on Hugging Face. Each sample is a pair of:
+* **code:** A MATLAB function or script.
+* **nl:** A natural language pseudocode description of what the code does.
+
+### Size and Splits
+* **Total samples:** 4,431 (after filtering 9 samples with empty code or pseudocode → 4,422 usable).
+* **Training set:** First 80% of samples.
+* **Test set:** Last 20% of samples (`train[-20%:]`), used for post-training BLEU evaluation.
+
+### Preprocessing
+Each sample is passed through the SemanticExtractor at dataset load time (not during training), which:
+1. Parses the MATLAB code via ANTLR into semantic operations.
+2. Extracts texts, depths, type_ids, and tree_roots.
+3. Caches the features in the dataset object so extraction is not repeated every epoch.
+
+Samples that produce zero semantic operations after extraction are filtered out.
+
+---
+
+## 14. Evaluation Metrics
+
+### BLEU Score
+**Bilingual Evaluation Understudy** — measures n-gram overlap between the generated pseudocode and the ground truth reference. Computed per-sample using `nltk.translate.bleu_score.sentence_bleu` with smoothing (Method 1) to handle short sequences.
+
+```
+score = sentence_bleu([reference_tokens], generated_tokens, smoothing_function=method1)
+```
+
+* Tokenization is whitespace-based (`.split()`).
+* Scores range from 0.0 (no overlap) to 1.0 (identical).
+* Averaged across all evaluation samples for a single aggregate metric.
+
+### Limitations of BLEU for This Task
+* **Synonym blindness:** "check if x > 0" and "verify that x is positive" have low BLEU despite being semantically equivalent.
+* **Order sensitivity:** Reordering steps that are logically equivalent will reduce the score.
+* **Length penalty:** Very short or very long generations are penalized even if correct.
+
+BLEU provides a rough directional signal (is generation quality improving?) but should not be interpreted as a measure of semantic correctness.
+
+### Projector Diagnostics
+Two additional metrics are tracked to detect **embedding collapse** (all projected vectors becoming identical):
+
+* **proj_var:** Variance across the D dimensions of the projected vectors, averaged over samples. If this drops to near zero, the projector is collapsing to a constant output regardless of input — the model has stopped encoding meaningful differences.
+* **proj_norm:** Average L2 norm of projected vectors. Tracks whether outputs are vanishing (norms → 0) or exploding (norms → infinity).
+
+### Efficiency Profiling
+Measured per-sample during evaluation:
+* **Encode time:** Time to run the full encoding pipeline (extraction + CodeBERT + Projector/RvNN).
+* **Generate time:** Time for Qwen's autoregressive generation loop.
+* **Tokens/sec:** Generation throughput.
+* **KV cache size:** Memory used by Qwen's key-value attention cache during generation.
+* **Peak VRAM:** Maximum GPU memory allocated during the full forward + generate pass.
+
+---
+
+## 15. Train Pipeline (`train/train_pipeline.py`)
+The main coordination script managing data loading, initialization, training loop, and evaluation across all model types.
 
 ### Key Features
-* **Gradient Accumulation:** Simulates larger batch sizes by summing gradients over multiple steps.
-* **Mixed Precision (AMP):** Utilizes `torch.amp` for float16 calculations, halving VRAM usage.
-* **OneCycleLR Scheduler:** Warms up the learning rate and decays it via a cosine curve for stable convergence.
+* **Gradient Accumulation:** Simulates larger batch sizes by summing gradients over multiple steps. With batch size 1 and accumulation 8, the effective batch size is 8. Gradients are divided by the accumulation count before the optimizer step.
+* **Mixed Precision (AMP):** Utilizes `torch.amp` with `float16` on CUDA. Forward passes run in half precision to halve VRAM usage and increase throughput. The GradScaler handles loss scaling to prevent underflow in float16 gradients.
+* **OneCycleLR Scheduler:** Warms up the learning rate over the first 10% of training steps, then decays via a cosine curve to zero. Separate max learning rates for base parameters and LoRA parameters.
 
-### LoRA Configurations
-* **Base Params:** Applied to the trainable Projector/RvNN/PixelEmbedder at a higher learning rate.
-* **LoRA Params:** Applied to the Qwen decoder adapter weights at a lower learning rate to preserve pre-trained knowledge.
+### Dual Learning Rate Groups
+When LoRA is active, the optimizer has two parameter groups:
+* **Base group** (Projector, RvNN, PixelEmbedder, PixelAdapter): trained at `3e-4`.
+* **LoRA group** (Qwen adapter matrices): trained at `1e-4`.
 
-### Evaluations & Metrics
-* **BLEU Scores:** Evaluates linguistic similarity between generated output and ground truth.
-* **Visualizations:** Auto-generates `loss_curve.png` and `bleu_scores.png`.
-* **Profiling:** Measures tokens per second, encode times, and peak VRAM to track computational costs.
+This separation prevents the adapter from changing too aggressively relative to the encoder pipeline.
+
+### Checkpointing
+Saves at regular intervals (`--save_every`) and whenever a new best loss is achieved. Each checkpoint contains:
+* Trainable model parameters (named, for partial loading).
+* LoRA adapter state dict.
+* Optimizer, scheduler, and scaler states (for exact resume).
+* Current epoch, step, best loss, and loss history.
+
+### Post-Training Evaluation
+After the training loop completes, the pipeline:
+1. Switches to eval mode.
+2. Loads the test split (last 20% of data).
+3. Generates pseudocode for `--eval_samples` samples.
+4. Computes per-sample BLEU scores with smoothing.
+5. Records projector diagnostics (variance, norm) and efficiency metrics.
+6. Saves loss curve and BLEU histogram as PNG files.
+7. Writes all metrics to a JSON file.
 
 ---
 
-## 10. Training Dynamics
+## 16. Training Dynamics
 
 ### Optimizer & Regularization
-*   **Optimizer:** The model uses **AdamW** (Adam with Weight Decay) to optimize the trainable parameters.
-*   **Weight Decay:** Set to `0.05` to provide L2 regularization and prevent overfitting on the MATLAB dataset.
-*   **Learning Rate Scheduler:** A **OneCycleLR** scheduler is used, which implements a warmup period followed by a cosine decay to zero.
+* **Optimizer:** AdamW (Adam with decoupled weight decay).
+* **Weight Decay:** `0.05` — provides L2 regularization to prevent overfitting on the small MATLAB dataset.
+* **Learning Rate Scheduler:** OneCycleLR with 10% warmup followed by cosine decay to zero.
 
 ### Loss Function
 See Section 7 (Qwen Decoder) for the full loss computation walkthrough.
 
 ### Hyperparameters
-*   **Peak Learning Rates:**
-    *   **Base Params** (Projector, RvNN, etc.): `3e-4`
-    *   **LoRA Params** (LLM Adapters): `1e-4` (tunable independently).
-*   **Effective Batch Size:**
-    *   **Batch Size:** 1
-    *   **Gradient Accumulation:** 8
-    *   **Effective Batch Size:** **8** (allows training large LLM decoders on memory-constrained hardware).
-*   **Mixed Precision:** Training uses **Automatic Mixed Precision (AMP)** with `float16` on CUDA devices to reduce VRAM footprint and increase throughput.
+* **Peak Learning Rates:**
+    * **Base Params** (Projector, RvNN, etc.): `3e-4`
+    * **LoRA Params** (LLM Adapters): `1e-4`
+* **Effective Batch Size:**
+    * **Batch Size:** 1
+    * **Gradient Accumulation:** 8
+    * **Effective Batch Size:** **8** (allows training large LLM decoders on memory-constrained hardware).
+* **Mixed Precision:** Training uses **Automatic Mixed Precision (AMP)** with `float16` on CUDA devices to reduce VRAM footprint and increase throughput.
