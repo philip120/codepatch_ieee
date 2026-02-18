@@ -131,6 +131,57 @@ Processes data bottom-up using recursive neural logic.
 * **Aggregation & Combination:** Passes encoded children through the aggregator, then merges the result with the parent embedding.
 * **Forest Handling:** Performs a final aggregation on all root nodes if a script contains multiple top-level blocks.
 
+### Gradient Flow Through the Tree (Backward Pass)
+
+The RvNN is trained by the same cross-entropy loss as the Projector. After loss computation, gradients flow back to the concatenation point where the `[M+1, D]` sequence was assembled. There they split: M gradients go to the Projector, 1 gradient goes to the RvNN's global vector.
+
+**Example tree:**
+
+```
+        function (root, index 0)
+        ├── if_statement (index 1)
+        │   ├── assignment (leaf, index 2)
+        │   └── assignment (leaf, index 3)
+        └── return (leaf, index 4)
+```
+
+**Forward (bottom-up):**
+
+```
+Step 1: Leaves (2, 3, 4) → return their pixel embeddings directly
+Step 2: if_statement (1) → aggregate children [2, 3] via child_aggregator MLP
+                         → combine self + child_summary via combiner
+Step 3: function (0)     → aggregate children [1, 4] via child_aggregator MLP
+                         → combine self + child_summary via combiner
+                         → output: [1, D] global vector
+```
+
+**Backward (top-down gradient flow):**
+
+```
+Step 1: Gradient arrives at the global vector [1, D]
+Step 2: Flows into function's combiner → updates combiner weights
+        Splits into:
+          - gradient to function's self_vec (pixel embedding 0)
+          - gradient to child_summary → flows into child_aggregator
+            → updates aggregator weights
+            Splits into:
+              - gradient to if_statement's output
+              - gradient to return's pixel embedding (leaf 4)
+Step 3: if_statement's gradient → flows into its combiner (same weights, more updates)
+        Splits into:
+          - gradient to if_statement's self_vec (pixel embedding 1)
+          - gradient to its child_summary → into aggregator (same weights again)
+            Splits into:
+              - gradient to leaf 2's pixel embedding
+              - gradient to leaf 3's pixel embedding
+Step 4: All pixel embedding gradients → PixelAdapter → updates adapter weights
+Step 5: → PixelEmbedder → updates depth/type embeddings
+Step 6: Stops at frozen CodeBERT
+```
+
+The child_aggregator and combiner are each **one set of weights shared across all tree levels**. Every internal node that used them contributes gradients. A deep tree with many internal nodes gives these MLPs more gradient signal per sample than a shallow one.
+
 ---
 
 ## 7. Qwen Decoder (`shared/qwen_decoder.py`)
