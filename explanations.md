@@ -263,6 +263,26 @@ L_t = −log P(y_t | y_{<t}, X_code, X_prompt)
 
 Where `P(y_t | ...)` is the softmax probability Qwen assigned to the correct token.
 
+### Clarification: What Is Compared Against What
+
+The ground truth pseudocode serves **two different roles**, and neither involves comparing embeddings against each other:
+
+1. **As input (embedded):** The ground truth is tokenized and converted to Qwen embeddings via its embedding table. These embeddings are concatenated into the input sequence so Qwen can attend over them during teacher forcing. This is how the model sees the correct context at every position.
+
+2. **As labels (integer IDs):** The same ground truth token IDs are used as classification targets for the loss. They are **not** embedded for this purpose — they are plain integer indices.
+
+At each position, Qwen's output head produces a vector of ~150K logits (one per word in its vocabulary). Cross-entropy loss uses the ground truth token ID as an index to look up how much probability the model assigned to the correct word:
+
+```
+Qwen output at position t:  [0.001, 0.003, ..., 0.40, ..., 0.002]  (150K probabilities)
+                                                    ↑
+                                          correct token index (integer)
+
+Loss = −log(0.40)
+```
+
+There is **no embedding-vs-embedding comparison**. The loss compares a predicted probability distribution against a correct token index. The model is penalized for assigning low probability to the correct word, regardless of how "close" any embedding is to another.
+
 ### Step 6: Final Loss
 
 Averaged over all T target positions:
