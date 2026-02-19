@@ -543,3 +543,84 @@ See Section 7 (Qwen Decoder) for the full loss computation walkthrough.
     * **Gradient Accumulation:** 8
     * **Effective Batch Size:** **8** (allows training large LLM decoders on memory-constrained hardware).
 * **Mixed Precision:** Training uses **Automatic Mixed Precision (AMP)** with `float16` on CUDA devices to reduce VRAM footprint and increase throughput.
+
+---
+
+## 17. Two-Stage Training Strategy
+
+### Motivation: The Unstable Target Problem
+
+When training from scratch in a single stage, the encoder pipeline (PixelEmbedder, Projector, RvNN) and the decoder (Qwen + LoRA) must adapt simultaneously. This creates a fundamental instability: the encoder has no stable target to learn from because the decoder is also changing every step. From the encoder's perspective, the loss landscape shifts constantly — gradients point in one direction on step N and a different direction on step N+1, not because the encoder's representation was wrong, but because the decoder's expectation changed.
+
+This parallels the challenge in multimodal training (e.g., LLaVA): if both the visual encoder and the language decoder are trained simultaneously from random weights, neither converges reliably. The standard solution is to first establish a stable decoder, then train the encoder to produce representations the stable decoder can interpret.
+
+### Stage 1: Text-Only Decoder Fine-Tuning (`train/train_stage1.py`)
+
+Stage 1 trains **only the Qwen decoder** on plain `(MATLAB code, pseudocode)` text pairs — no encoder, no projected embeddings.
+
+**Input format:**
+
+```
+[tokenized MATLAB code (max 512 tokens)] + [task prompt] + [target pseudocode]
+```
+
+The MATLAB code is passed as raw text through Qwen's embedding table (not through the encoder pipeline). Labels are masked to `-100` for the code and prompt positions; loss is computed only on the pseudocode tokens — identical masking to `forward_train`.
+
+**What Stage 1 teaches the decoder:**
+* The mapping from MATLAB syntax to pseudocode phrasing.
+* Task-specific vocabulary and output structure.
+* How to follow the task prompt format.
+
+After Stage 1, the LoRA weights encode a stable MATLAB→pseudocode prior. The decoder already knows what a good pseudocode output looks like given code context. This is saved to `checkpoints_stage1/best_model.pt` with the `lora_state` key.
+
+### Stage 2: Encoder Training Against Stable Decoder (`train/train_pipeline.py`)
+
+Stage 2 loads the Stage 1 LoRA weights into the decoder via `--stage1_checkpoint`, then trains the full encoder pipeline (Projector, RvNN, PixelEmbedder) against this stable target.
+
+```python
+# Loader block in train_pipeline.py (after enable_lora, before optimizer):
+if stage1_checkpoint:
+    s1_ckpt = torch.load(stage1_checkpoint, ...)
+    model.decoder.load_lora_state_dict(s1_ckpt["lora_state"])
+```
+
+Because the decoder already knows how to generate pseudocode from text tokens, it provides a consistent training signal to the encoder: "produce embeddings that look like the text representations I was trained on." The encoder learns to map code structure into the same semantic space the decoder expects.
+
+If `--resume` is also passed, the resume checkpoint runs after the Stage 1 loader and overwrites LoRA weights — correct behavior (resume wins over warm-start).
+
+### Checkpoint Format Contract
+
+Both stages share the same `lora_state` key and format, ensuring compatibility with `load_lora_state_dict`:
+
+| Key | Stage 1 | Stage 2 |
+|-----|---------|---------|
+| `lora_state` | ✓ | ✓ |
+| `model_state` | — | ✓ |
+| `stage` | 1 | — |
+| `model_type` | — | ✓ |
+| `optimizer`, `scheduler`, `scaler` | ✓ | ✓ |
+| `step`, `epoch`, `best_loss`, `loss_history` | ✓ | ✓ |
+
+### Rank/Layer Mismatch Warning
+
+`--lora_rank` and `--lora_layers` **must match** between Stage 1 and Stage 2. `load_lora_state_dict` uses `strict=False` and silently skips keys with mismatched shapes — a mismatch means Stage 2 starts with random LoRA weights despite passing a Stage 1 checkpoint.
+
+### Usage
+
+```bash
+# Stage 1: fine-tune Qwen on plain text MATLAB→pseudocode
+python -m train.train_stage1 \
+    --epochs 5 --lora_rank 16 --lora_alpha 128 --lora_layers 12 \
+    --grad_accum 4 --lr 2e-4 --save_dir checkpoints_stage1
+
+# Stage 2: train encoder with Stage 1 warm-start decoder
+python -m train.train_pipeline \
+    --model combined --epochs 10 --lora --lora_rank 16 --lora_alpha 128 --lora_layers 12 \
+    --grad_accum 8 --lr 3e-4 --lora_lr 1e-4 --dropout 0.05 --bottleneck 768 \
+    --stage1_checkpoint checkpoints_stage1/best_model.pt \
+    --save_dir checkpoints_stage2
+```
+
+### Expected Behavior
+* **Stage 1:** Loss decreases from ~3.0 to <1.5 over 5 epochs on ~4K text pairs.
+* **Stage 2:** On startup, prints `Loaded N LoRA tensors from Stage 1.` Generation quality (BLEU) should exceed a single-stage baseline trained for the same number of epochs.

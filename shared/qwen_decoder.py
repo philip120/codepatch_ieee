@@ -185,6 +185,68 @@ class QwenDecoder:
 
         return outputs.loss
 
+    def forward_train_text(self, matlab_code: str, target_text: str) -> torch.Tensor:
+        """
+        Training forward pass using raw text (no projected embeddings).
+
+        Used in Stage 1 training to fine-tune the decoder on plain
+        MATLAB→pseudocode pairs before the encoder pipeline is trained
+        against it.
+
+        Args:
+            matlab_code: raw MATLAB source code string
+            target_text: ground truth pseudocode
+
+        Returns:
+            loss: cross-entropy loss on target text tokens only
+        """
+        # Tokenize MATLAB code with larger max_length to fit full functions
+        code_tokens = self.tokenizer(
+            matlab_code,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512,
+            padding=True,
+        ).to(self.device)
+        code_embeds = self.model.get_input_embeddings()(code_tokens.input_ids)
+
+        # Get prompt embeddings
+        prompt_embeds, prompt_tokens = self.get_input_embeddings(PROMPT)
+
+        # Get target embeddings
+        target_embeds, target_tokens = self.get_input_embeddings(target_text)
+
+        # Concatenate: [code] + [prompt] + [target text]
+        input_embeds = torch.cat([code_embeds, prompt_embeds, target_embeds], dim=1)
+
+        # Create attention mask
+        num_code = code_embeds.shape[1]
+        num_prompt = prompt_embeds.shape[1]
+        attn_mask = torch.cat([
+            code_tokens.attention_mask,
+            prompt_tokens.attention_mask,
+            target_tokens.attention_mask,
+        ], dim=1)
+
+        # Create labels: -100 for code and prompt, ground truth IDs for target
+        code_labels = torch.full(
+            (1, num_code), -100, dtype=torch.long, device=self.device
+        )
+        prompt_labels = torch.full(
+            (1, num_prompt), -100, dtype=torch.long, device=self.device
+        )
+        target_labels = target_tokens.input_ids.clone()
+        labels = torch.cat([code_labels, prompt_labels, target_labels], dim=1)
+
+        # Forward through Qwen
+        outputs = self.model(
+            inputs_embeds=input_embeds,
+            attention_mask=attn_mask,
+            labels=labels,
+        )
+
+        return outputs.loss
+
     @torch.no_grad()
     def generate(
         self,

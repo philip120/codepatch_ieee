@@ -87,6 +87,7 @@ def train(
     lora_lr: float = 1e-4,
     eval_samples: int = 50,
     resume: str = None,
+    stage1_checkpoint: str = None,
 ):
     """Main training function."""
     print("=" * 60)
@@ -133,6 +134,17 @@ def train(
             dropout=lora_dropout,
             num_layers=lora_layers,
         )
+
+    # Load Stage 1 LoRA weights into decoder before optimizer construction
+    if stage1_checkpoint:
+        print(f"\nLoading Stage 1 LoRA weights from: {stage1_checkpoint}")
+        s1_ckpt = torch.load(stage1_checkpoint, map_location=DEVICE, weights_only=False)
+        if "lora_state" not in s1_ckpt or not s1_ckpt["lora_state"]:
+            raise ValueError("Stage 1 checkpoint has no 'lora_state'.")
+        if not lora:
+            raise ValueError("--stage1_checkpoint requires --lora.")
+        model.decoder.load_lora_state_dict(s1_ckpt["lora_state"])
+        print(f"  Loaded {len(s1_ckpt['lora_state'])} LoRA tensors from Stage 1.")
 
     print(f"\nTrainable parameters: {model.num_trainable_parameters():,}")
 
@@ -512,6 +524,8 @@ if __name__ == "__main__":
 
     # Resume
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--stage1_checkpoint", type=str, default=None,
+                        help="Path to Stage 1 LoRA checkpoint. Loads into decoder before Stage 2 encoder training.")
 
     args = parser.parse_args()
 
@@ -537,4 +551,5 @@ if __name__ == "__main__":
         lora_lr=args.lora_lr,
         eval_samples=args.eval_samples,
         resume=args.resume,
+        stage1_checkpoint=args.stage1_checkpoint,
     )
