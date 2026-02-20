@@ -54,6 +54,12 @@ if __name__ == "__main__":
     parser.add_argument("--stage1_checkpoint", type=str, default=None,
                         help="Path to existing Stage 1 checkpoint (skips Stage 1 training)")
 
+    # Resume args
+    parser.add_argument("--s1_resume", type=str, default=None,
+                        help="Resume Stage 1 from this checkpoint")
+    parser.add_argument("--s2_resume", type=str, default=None,
+                        help="Resume Stage 2 from this checkpoint")
+
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-4B-Instruct-2507")
     parser.add_argument("--split", type=str, default="train")
 
@@ -82,7 +88,7 @@ if __name__ == "__main__":
             save_every=100,
             save_dir=args.s1_save_dir,
             split=args.split,
-            resume=None,
+            resume=args.s1_resume,
             model_name=args.model_name,
         )
     else:
@@ -115,7 +121,7 @@ if __name__ == "__main__":
         lora_layers=args.lora_layers,
         lora_lr=args.s2_lora_lr,
         eval_samples=50,
-        resume=None,
+        resume=args.s2_resume,
         stage1_checkpoint=s1_best,
     )
 
