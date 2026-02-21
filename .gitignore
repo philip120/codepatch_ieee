@@ -1,0 +1,37 @@
+# Checkpoints
+checkpoints/
+checkpoints_stage1/
+checkpoints_stage2/
+*.pt
+*.pth
+
+# Logs & outputs
+*.png
+metrics.json
+loss_curve.png
+bleu_scores.png
+parser.out
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Env
+.env
+*.env
+
+# OS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Large data
+dataset/
+*.csv
+*.json
+textfiles/
