@@ -167,7 +167,9 @@ def train(
         )
 
     # Learning rate scheduler — warmup + cosine decay
-    total_steps = epochs * len(loader) // gradient_accumulation
+    # Use ceil to avoid off-by-one: integer division can undercount by 1
+    import math
+    total_steps = math.ceil(epochs * len(loader) / gradient_accumulation)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=[lr, lora_lr] if lora else lr,

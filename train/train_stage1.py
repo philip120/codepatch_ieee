@@ -101,7 +101,9 @@ def train(
     optimizer = torch.optim.AdamW(lora_params, lr=lr, weight_decay=weight_decay)
 
     # OneCycleLR scheduler
-    total_steps = epochs * len(loader) // grad_accum
+    # Use ceil to avoid off-by-one: integer division can undercount by 1
+    import math
+    total_steps = math.ceil(epochs * len(loader) / grad_accum)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=lr,
