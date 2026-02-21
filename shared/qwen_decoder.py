@@ -271,14 +271,20 @@ class QwenDecoder:
         projected = projected.unsqueeze(0).to(self.model.dtype)
 
         # Get prompt embeddings
-        prompt_embeds, _ = self.get_input_embeddings(PROMPT)
+        prompt_embeds, prompt_tokens = self.get_input_embeddings(PROMPT)
 
         # Concatenate: [patches] + [prompt]
         input_embeds = torch.cat([projected, prompt_embeds], dim=1)
 
+        # Build attention mask for full prefix (all 1s — no padding)
+        num_patches = projected.shape[1]
+        patch_mask = torch.ones(1, num_patches, device=self.device)
+        attention_mask = torch.cat([patch_mask, prompt_tokens.attention_mask], dim=1)
+
         # Generate
         outputs = self.model.generate(
             inputs_embeds=input_embeds,
+            attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
             do_sample=True,
             temperature=temperature,
@@ -298,9 +304,13 @@ class QwenDecoder:
     ) -> tuple:
         """Generate text and return (text, metrics_dict)."""
         projected = projected.unsqueeze(0).to(self.model.dtype)
-        prompt_embeds, _ = self.get_input_embeddings(PROMPT)
+        prompt_embeds, prompt_tokens = self.get_input_embeddings(PROMPT)
         input_embeds = torch.cat([projected, prompt_embeds], dim=1)
         num_input_tokens = input_embeds.shape[1]
+
+        num_patches = projected.shape[1]
+        patch_mask = torch.ones(1, num_patches, device=self.device)
+        attention_mask = torch.cat([patch_mask, prompt_tokens.attention_mask], dim=1)
 
         if self.device == "cuda":
             torch.cuda.synchronize()
@@ -308,6 +318,7 @@ class QwenDecoder:
 
         outputs = self.model.generate(
             inputs_embeds=input_embeds,
+            attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
             do_sample=True,
             temperature=temperature,
