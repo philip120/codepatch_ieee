@@ -214,15 +214,15 @@ def train(
                     running_loss = 0.0
 
                 if global_step % save_every == 0:
+                    # Lite checkpoint: skip qwen_state + optimizer (too large for disk)
+                    # Use best_model.pt to resume Qwen weights
                     checkpoint = {
                         'stage': 1,
                         'step': global_step,
                         'epoch': epoch,
                         'lora_state': decoder.get_lora_state_dict(),
-                        'qwen_state': decoder.get_unfrozen_state_dict() if unfreeze_layers > 0 else {},
-                        'optimizer': optimizer.state_dict(),
+                        'qwen_state': {} if unfreeze_layers > 0 else {},
                         'scheduler': scheduler.state_dict(),
-                        'scaler': scaler.state_dict(),
                         'best_loss': best_loss,
                         'loss_history': loss_history,
                     }
@@ -234,14 +234,14 @@ def train(
 
         if avg_epoch_loss < best_loss:
             best_loss = avg_epoch_loss
+            # Full checkpoint: include qwen_state, skip optimizer (17GB for 2.2B params)
             checkpoint = {
                 'stage': 1,
                 'step': global_step,
                 'epoch': epoch,
                 'lora_state': decoder.get_lora_state_dict(),
-                'optimizer': optimizer.state_dict(),
+                'qwen_state': decoder.get_unfrozen_state_dict() if unfreeze_layers > 0 else {},
                 'scheduler': scheduler.state_dict(),
-                'scaler': scaler.state_dict(),
                 'best_loss': best_loss,
                 'loss_history': loss_history,
             }

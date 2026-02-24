@@ -298,7 +298,8 @@ def train(
             # Update weights after accumulation
             if accumulation_step % gradient_accumulation == 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.get_trainable_parameters(), max_norm=1.0)
+                all_trainable = [p for p in model.parameters() if p.requires_grad]
+                torch.nn.utils.clip_grad_norm_(all_trainable, max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
@@ -336,6 +337,8 @@ def train(
 
                 # Save checkpoint
                 if global_step % save_every == 0:
+                    # Lite checkpoint: encoder params only, skip qwen_state + optimizer
+                    # (qwen_state ~3.6GB + optimizer ~14GB = disk full in 2 saves)
                     checkpoint = {
                         'step': global_step,
                         'epoch': epoch,
@@ -343,16 +346,14 @@ def train(
                         'model_state': {
                             name: param.data
                             for name, param in model.named_parameters()
-                            if param.requires_grad
+                            if param.requires_grad and 'decoder' not in name
                         },
-                        'optimizer': optimizer.state_dict(),
                         'scheduler': scheduler.state_dict(),
-                        'scaler': scaler.state_dict(),
                         'loss': epoch_loss / max(epoch_samples, 1),
                         'best_loss': best_loss,
                         'loss_history': loss_history,
                         'lora_state': model.decoder.get_lora_state_dict() if lora else {},
-                        'qwen_state': model.decoder.get_unfrozen_state_dict() if unfreeze_layers > 0 else {},
+                        'qwen_state': {},
                     }
                     torch.save(checkpoint, save_path / f"checkpoint_{global_step}.pt")
                     print(f"  Saved checkpoint_{global_step}.pt")
@@ -364,6 +365,7 @@ def train(
         # Save best model
         if avg_epoch_loss < best_loss:
             best_loss = avg_epoch_loss
+            # Skip optimizer state: ~17GB for 2.2B unfrozen Qwen params
             checkpoint = {
                 'step': global_step,
                 'epoch': epoch,
@@ -373,9 +375,7 @@ def train(
                     for name, param in model.named_parameters()
                     if param.requires_grad
                 },
-                'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict(),
-                'scaler': scaler.state_dict(),
                 'loss': best_loss,
                 'best_loss': best_loss,
                 'loss_history': loss_history,
