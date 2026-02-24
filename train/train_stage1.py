@@ -122,11 +122,9 @@ def train(
     )
 
     # Mixed precision
-    # bfloat16 has float32 dynamic range — no gradient scaling needed (A100 native)
-    # float16 + GradScaler would fail for unfrozen fp16 params ("unscale FP16 gradients")
+    # bfloat16: same dynamic range as float32, no gradient scaling needed (A100 native)
     use_amp = DEVICE == "cuda"
-    amp_dtype = torch.bfloat16 if unfreeze_layers > 0 else torch.float16
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp and unfreeze_layers == 0)
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
 
     # Training state
     global_step = 0
@@ -185,7 +183,7 @@ def train(
             code = batch['code']
             target = batch['target']
 
-            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
                 loss = decoder.forward_train_text(code, target)
 
             if loss is None or loss.item() == 0:
