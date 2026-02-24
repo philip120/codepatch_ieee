@@ -44,7 +44,13 @@ if __name__ == "__main__":
     parser.add_argument("--bottleneck", type=int, default=768)
     parser.add_argument("--dropout", type=float, default=0.05)
 
-    # Shared LoRA args (must match between stages)
+    # Decoder adaptation — choose one: unfreeze (recommended) or LoRA
+    parser.add_argument("--unfreeze_layers", type=int, default=18,
+                        help="Unfreeze last N Qwen layers (0 = use LoRA instead)")
+    parser.add_argument("--qwen_lr", type=float, default=1e-5,
+                        help="LR for unfrozen Qwen layers")
+
+    # LoRA args (used only if --unfreeze_layers 0)
     parser.add_argument("--lora_rank", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=128)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
@@ -90,6 +96,7 @@ if __name__ == "__main__":
             split=args.split,
             resume=args.s1_resume,
             model_name=args.model_name,
+            unfreeze_layers=args.unfreeze_layers,
         )
     else:
         print(f"\nSkipping Stage 1. Using checkpoint: {s1_best}")
@@ -114,12 +121,14 @@ if __name__ == "__main__":
         save_every=100,
         save_dir=args.s2_save_dir,
         gradient_accumulation=args.s2_grad_accum,
-        lora=True,
+        lora=args.unfreeze_layers == 0,
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         lora_layers=args.lora_layers,
         lora_lr=args.s2_lora_lr,
+        unfreeze_layers=args.unfreeze_layers,
+        qwen_lr=args.qwen_lr,
         eval_samples=50,
         resume=args.s2_resume,
         stage1_checkpoint=s1_best,

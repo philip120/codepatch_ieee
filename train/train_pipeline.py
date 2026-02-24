@@ -88,6 +88,8 @@ def train(
     eval_samples: int = 50,
     resume: str = None,
     stage1_checkpoint: str = None,
+    unfreeze_layers: int = 0,
+    qwen_lr: float = 1e-5,
 ):
     """Main training function."""
     print("=" * 60)
@@ -104,6 +106,8 @@ def train(
     print(f"Gradient accumulation: {gradient_accumulation}")
     print(f"Mixed precision (AMP): {DEVICE == 'cuda'}")
     print(f"LoRA: {lora} (rank={lora_rank}, alpha={lora_alpha}, layers={lora_layers}, lora_lr={lora_lr})")
+    if unfreeze_layers > 0:
+        print(f"Unfreeze: last {unfreeze_layers} Qwen layers (qwen_lr={qwen_lr})")
     if resume:
         print(f"Resuming from: {resume}")
 
@@ -126,7 +130,7 @@ def train(
     print("Creating model...")
     model = create_model(model_type, patch_size, bottleneck_dim, dropout)
 
-    # Enable LoRA before optimizer so get_trainable_parameters() includes LoRA params
+    # Enable LoRA or unfreeze Qwen layers before optimizer construction
     if lora:
         model.enable_lora(
             rank=lora_rank,
@@ -134,21 +138,29 @@ def train(
             dropout=lora_dropout,
             num_layers=lora_layers,
         )
+    if unfreeze_layers > 0:
+        model.decoder.unfreeze_layers(unfreeze_layers)
 
-    # Load Stage 1 LoRA weights into decoder before optimizer construction
+    # Load Stage 1 weights into decoder before optimizer construction
     if stage1_checkpoint:
-        print(f"\nLoading Stage 1 LoRA weights from: {stage1_checkpoint}")
+        print(f"\nLoading Stage 1 weights from: {stage1_checkpoint}")
         s1_ckpt = torch.load(stage1_checkpoint, map_location=DEVICE, weights_only=False)
-        if "lora_state" not in s1_ckpt or not s1_ckpt["lora_state"]:
-            raise ValueError("Stage 1 checkpoint has no 'lora_state'.")
-        if not lora:
-            raise ValueError("--stage1_checkpoint requires --lora.")
-        model.decoder.load_lora_state_dict(s1_ckpt["lora_state"])
-        print(f"  Loaded {len(s1_ckpt['lora_state'])} LoRA tensors from Stage 1.")
+        if s1_ckpt.get("qwen_state"):
+            if unfreeze_layers == 0:
+                raise ValueError("Stage 1 used unfreeze but Stage 2 does not. Pass --unfreeze_layers.")
+            model.decoder.load_unfrozen_state_dict(s1_ckpt["qwen_state"])
+            print(f"  Loaded {len(s1_ckpt['qwen_state'])} Qwen tensors from Stage 1.")
+        elif s1_ckpt.get("lora_state"):
+            if not lora:
+                raise ValueError("Stage 1 used LoRA but Stage 2 does not. Pass --lora.")
+            model.decoder.load_lora_state_dict(s1_ckpt["lora_state"])
+            print(f"  Loaded {len(s1_ckpt['lora_state'])} LoRA tensors from Stage 1.")
+        else:
+            raise ValueError("Stage 1 checkpoint has neither 'qwen_state' nor 'lora_state'.")
 
     print(f"\nTrainable parameters: {model.num_trainable_parameters():,}")
 
-    # Optimizer — separate LR groups when LoRA is active
+    # Optimizer — separate LR groups for encoder vs decoder adaptation
     if lora:
         lora_ids = set(id(p) for p in model.decoder.get_lora_parameters())
         base_params = [p for p in model.get_trainable_parameters() if id(p) not in lora_ids]
@@ -157,8 +169,17 @@ def train(
             {'params': base_params, 'lr': lr},
             {'params': lora_params, 'lr': lora_lr},
         ], weight_decay=weight_decay)
-        print(f"\nParam groups: base ({len(base_params)} tensors, lr={lr}) "
+        print(f"\nParam groups: encoder ({len(base_params)} tensors, lr={lr}) "
               f"+ LoRA ({len(lora_params)} tensors, lr={lora_lr})")
+    elif unfreeze_layers > 0:
+        encoder_params = model.get_trainable_parameters()
+        qwen_params = model.decoder.get_unfrozen_parameters()
+        optimizer = torch.optim.AdamW([
+            {'params': encoder_params, 'lr': lr},
+            {'params': qwen_params, 'lr': qwen_lr},
+        ], weight_decay=weight_decay)
+        print(f"\nParam groups: encoder ({len(encoder_params)} tensors, lr={lr}) "
+              f"+ Qwen unfrozen ({len(qwen_params)} tensors, lr={qwen_lr})")
     else:
         optimizer = torch.optim.AdamW(
             model.get_trainable_parameters(),
@@ -170,9 +191,15 @@ def train(
     # Use ceil to avoid off-by-one: integer division can undercount by 1
     import math
     total_steps = math.ceil(epochs * len(loader) / gradient_accumulation)
+    if lora:
+        max_lrs = [lr, lora_lr]
+    elif unfreeze_layers > 0:
+        max_lrs = [lr, qwen_lr]
+    else:
+        max_lrs = lr
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=[lr, lora_lr] if lora else lr,
+        max_lr=max_lrs,
         total_steps=total_steps,
         pct_start=0.1,
         anneal_strategy="cos",
@@ -209,9 +236,11 @@ def train(
                     loaded += 1
             print(f"  Restored {loaded} parameter tensors")
 
-        # Restore LoRA state
+        # Restore LoRA or unfrozen Qwen state
         if lora and 'lora_state' in ckpt and ckpt['lora_state']:
             model.decoder.load_lora_state_dict(ckpt['lora_state'])
+        if unfreeze_layers > 0 and 'qwen_state' in ckpt and ckpt['qwen_state']:
+            model.decoder.load_unfrozen_state_dict(ckpt['qwen_state'])
 
         # Restore optimizer, scheduler, scaler
         if 'optimizer' in ckpt:
@@ -322,6 +351,7 @@ def train(
                         'best_loss': best_loss,
                         'loss_history': loss_history,
                         'lora_state': model.decoder.get_lora_state_dict() if lora else {},
+                        'qwen_state': model.decoder.get_unfrozen_state_dict() if unfreeze_layers > 0 else {},
                     }
                     torch.save(checkpoint, save_path / f"checkpoint_{global_step}.pt")
                     print(f"  Saved checkpoint_{global_step}.pt")
@@ -349,6 +379,7 @@ def train(
                 'best_loss': best_loss,
                 'loss_history': loss_history,
                 'lora_state': model.decoder.get_lora_state_dict() if lora else {},
+                'qwen_state': model.decoder.get_unfrozen_state_dict() if unfreeze_layers > 0 else {},
             }
             torch.save(checkpoint, save_path / "best_model.pt")
             print(f"  New best model! Loss: {best_loss:.4f}")
@@ -527,7 +558,13 @@ if __name__ == "__main__":
     # Resume
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--stage1_checkpoint", type=str, default=None,
-                        help="Path to Stage 1 LoRA checkpoint. Loads into decoder before Stage 2 encoder training.")
+                        help="Path to Stage 1 checkpoint. Loads into decoder before Stage 2 encoder training.")
+
+    # Full fine-tuning (alternative to LoRA)
+    parser.add_argument("--unfreeze_layers", type=int, default=0,
+                        help="Unfreeze last N Qwen layers fully (replaces LoRA). 18 recommended for A100 40GB.")
+    parser.add_argument("--qwen_lr", type=float, default=1e-5,
+                        help="LR for unfrozen Qwen layers (much lower than encoder lr to avoid forgetting)")
 
     args = parser.parse_args()
 
@@ -554,4 +591,6 @@ if __name__ == "__main__":
         eval_samples=args.eval_samples,
         resume=args.resume,
         stage1_checkpoint=args.stage1_checkpoint,
+        unfreeze_layers=args.unfreeze_layers,
+        qwen_lr=args.qwen_lr,
     )

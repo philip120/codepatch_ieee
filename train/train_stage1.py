@@ -50,6 +50,7 @@ def train(
     split: str = "train",
     resume: str = None,
     model_name: str = "Qwen/Qwen3-4B-Instruct-2507",
+    unfreeze_layers: int = 0,
 ):
     """Stage 1 training: text-only decoder fine-tuning."""
     print("=" * 60)
@@ -60,7 +61,10 @@ def train(
     print(f"Learning rate: {lr}")
     print(f"Weight decay: {weight_decay}")
     print(f"Gradient accumulation: {grad_accum}")
-    print(f"LoRA: rank={lora_rank}, alpha={lora_alpha}, dropout={lora_dropout}, layers={lora_layers}")
+    if unfreeze_layers > 0:
+        print(f"Mode: full fine-tune last {unfreeze_layers} Qwen layers")
+    else:
+        print(f"Mode: LoRA rank={lora_rank}, alpha={lora_alpha}, dropout={lora_dropout}, layers={lora_layers}")
     print(f"Mixed precision (AMP): {DEVICE == 'cuda'}")
     if resume:
         print(f"Resuming from: {resume}")
@@ -87,18 +91,23 @@ def train(
     print("\n" + "=" * 60)
     print("Loading Qwen decoder...")
     decoder = QwenDecoder(model_name=model_name, device=DEVICE)
-    decoder.enable_lora(
-        rank=lora_rank,
-        alpha=lora_alpha,
-        dropout=lora_dropout,
-        num_layers=lora_layers,
-    )
 
-    lora_params = decoder.get_lora_parameters()
-    print(f"Trainable LoRA parameters: {sum(p.numel() for p in lora_params):,}")
+    if unfreeze_layers > 0:
+        decoder.unfreeze_layers(unfreeze_layers)
+        trainable_params = decoder.get_unfrozen_parameters()
+    else:
+        decoder.enable_lora(
+            rank=lora_rank,
+            alpha=lora_alpha,
+            dropout=lora_dropout,
+            num_layers=lora_layers,
+        )
+        trainable_params = decoder.get_lora_parameters()
 
-    # Optimizer on LoRA params only
-    optimizer = torch.optim.AdamW(lora_params, lr=lr, weight_decay=weight_decay)
+    print(f"Trainable parameters: {sum(p.numel() for p in trainable_params):,}")
+
+    # Optimizer
+    optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=weight_decay)
 
     # OneCycleLR scheduler
     # Use ceil to avoid off-by-one: integer division can undercount by 1
@@ -129,7 +138,9 @@ def train(
         print(f"\nResuming from {resume}...")
         ckpt = torch.load(resume, map_location=DEVICE, weights_only=False)
 
-        if 'lora_state' in ckpt and ckpt['lora_state']:
+        if unfreeze_layers > 0 and 'qwen_state' in ckpt and ckpt['qwen_state']:
+            decoder.load_unfrozen_state_dict(ckpt['qwen_state'])
+        elif 'lora_state' in ckpt and ckpt['lora_state']:
             decoder.load_lora_state_dict(ckpt['lora_state'])
 
         if 'optimizer' in ckpt:
@@ -187,7 +198,7 @@ def train(
 
             if accumulation_step % grad_accum == 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(lora_params, max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
@@ -207,6 +218,7 @@ def train(
                         'step': global_step,
                         'epoch': epoch,
                         'lora_state': decoder.get_lora_state_dict(),
+                        'qwen_state': decoder.get_unfrozen_state_dict() if unfreeze_layers > 0 else {},
                         'optimizer': optimizer.state_dict(),
                         'scheduler': scheduler.state_dict(),
                         'scaler': scaler.state_dict(),
@@ -241,11 +253,12 @@ def train(
         'step': global_step,
         'epoch': epochs - 1,
         'lora_state': decoder.get_lora_state_dict(),
+        'qwen_state': decoder.get_unfrozen_state_dict() if unfreeze_layers > 0 else {},
         'best_loss': best_loss,
         'loss_history': loss_history,
     }
-    torch.save(final_checkpoint, save_path / "lora_final.pt")
-    print(f"\nSaved lora_final.pt")
+    torch.save(final_checkpoint, save_path / "final.pt")
+    print(f"\nSaved final.pt")
 
     # Save loss curve
     if loss_history:
@@ -301,6 +314,8 @@ if __name__ == "__main__":
     parser.add_argument("--split", type=str, default="train")
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-4B-Instruct-2507")
+    parser.add_argument("--unfreeze_layers", type=int, default=0,
+                        help="Unfreeze last N Qwen layers fully (replaces LoRA). 18 recommended for A100 40GB.")
 
     args = parser.parse_args()
 
@@ -319,4 +334,5 @@ if __name__ == "__main__":
         split=args.split,
         resume=args.resume,
         model_name=args.model_name,
+        unfreeze_layers=args.unfreeze_layers,
     )

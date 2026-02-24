@@ -53,6 +53,8 @@ class QwenDecoder:
             param.requires_grad = False
 
         self.lora_enabled = False
+        self.unfrozen_enabled = False
+        self.unfrozen_layers = []
 
         print(f"Qwen loaded on {self.device} (frozen)")
 
@@ -101,9 +103,58 @@ class QwenDecoder:
         self.model.load_state_dict(state_dict, strict=False)
         print(f"Loaded LoRA state ({len(state_dict)} tensors)")
 
+    def unfreeze_layers(self, num_layers: int = 18):
+        """Unfreeze the last `num_layers` Qwen transformer layers for full fine-tuning."""
+        total_layers = self.model.config.num_hidden_layers
+        target_layers = list(range(total_layers - num_layers, total_layers))
+
+        unfrozen_params = 0
+        for i in target_layers:
+            for param in self.model.model.layers[i].parameters():
+                param.requires_grad = True
+                unfrozen_params += param.numel()
+
+        # Also unfreeze final norm and lm_head — critical for generation quality
+        for param in self.model.model.norm.parameters():
+            param.requires_grad = True
+            unfrozen_params += param.numel()
+        for param in self.model.lm_head.parameters():
+            param.requires_grad = True
+            unfrozen_params += param.numel()
+
+        self.unfrozen_layers = target_layers
+        self.unfrozen_enabled = True
+        print(f"Unfrozen layers {target_layers[0]}-{target_layers[-1]} + norm + lm_head: "
+              f"{unfrozen_params:,} trainable Qwen params")
+
+    def get_unfrozen_parameters(self):
+        """Return unfrozen Qwen parameters."""
+        if not self.unfrozen_enabled:
+            return []
+        return [p for p in self.model.parameters() if p.requires_grad]
+
+    def get_unfrozen_state_dict(self):
+        """Return state dict of unfrozen Qwen components for checkpointing."""
+        if not self.unfrozen_enabled:
+            return {}
+        state = {}
+        for k, v in self.model.state_dict().items():
+            if any(f'layers.{i}.' in k for i in self.unfrozen_layers):
+                state[k] = v
+            elif k.startswith('model.norm') or k.startswith('lm_head'):
+                state[k] = v
+        return state
+
+    def load_unfrozen_state_dict(self, state_dict):
+        """Load unfrozen Qwen layer weights from checkpoint."""
+        if not self.unfrozen_enabled or not state_dict:
+            return
+        self.model.load_state_dict(state_dict, strict=False)
+        print(f"Loaded unfrozen Qwen state ({len(state_dict)} tensors)")
+
     def train_mode(self):
-        """Set Qwen to train mode (needed for LoRA dropout)."""
-        if self.lora_enabled:
+        """Set Qwen to train mode (needed for dropout in unfrozen layers / LoRA)."""
+        if self.lora_enabled or self.unfrozen_enabled:
             self.model.train()
 
     def eval_mode(self):

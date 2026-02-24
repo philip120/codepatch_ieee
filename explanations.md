@@ -624,3 +624,86 @@ python -m train.train_pipeline \
 ### Expected Behavior
 * **Stage 1:** Loss decreases from ~3.0 to <1.5 over 5 epochs on ~4K text pairs.
 * **Stage 2:** On startup, prints `Loaded N LoRA tensors from Stage 1.` Generation quality (BLEU) should exceed a single-stage baseline trained for the same number of epochs.
+
+---
+
+## 18. Full Layer Unfreeze (Replacing LoRA)
+
+### Motivation
+
+LoRA restricts adaptation to low-rank updates in `q_proj` and `v_proj` only. For a task like MATLAB→pseudocode, where the input modality (projected code embeddings) is fundamentally different from what Qwen was pre-trained on (text tokens), this bottleneck limits how much the decoder can adapt its internal representations to the new input distribution. Full layer unfreeze removes this constraint.
+
+### What Changes
+
+Instead of injecting LoRA adapters, the last N transformer layers of Qwen are fully unfrozen — all weights (q, k, v, o projections, MLP, layer norm) are trainable. The final layer norm (`model.norm`) and the language model head (`lm_head`) are also unfrozen, as they are critical for the output token distribution.
+
+```
+Frozen:    Qwen layers 0–17  (general language understanding)
+Trainable: Qwen layers 18–35 (task-specific generation)
+           model.norm
+           lm_head
+```
+
+For Qwen3-4B with 36 layers, unfreezing the last 18 layers adds approximately **~2 billion trainable parameters** compared to ~2M for LoRA rank 16.
+
+### VRAM Budget (A100 40GB)
+
+| Component | VRAM |
+|-----------|------|
+| Full model weights (float16) | ~8 GB |
+| Encoder pipeline | ~2 GB |
+| Gradients for 18 unfrozen layers | ~4 GB |
+| Adam optimizer states (float32) | ~8 GB |
+| Activations | ~3 GB |
+| **Total** | **~25 GB** |
+
+This fits comfortably on a 40GB A100. Unfreezing all 36 layers would push to ~36GB (tight but possible).
+
+### Dual Learning Rate
+
+Two separate optimizer parameter groups prevent catastrophic forgetting:
+
+* **Encoder group** (PixelEmbedder, Projector, RvNN): `lr = 3e-4` — learns fast from scratch.
+* **Qwen group** (unfrozen layers): `lr = 1e-5` — 30× lower, nudges pre-trained weights rather than overwriting them.
+
+The encoder LR is high because these modules start from random initialization and need strong gradient signal. The Qwen LR is low because the pre-trained weights already contain valuable language knowledge — large updates would destroy this.
+
+### Checkpoint Format
+
+Unfrozen Qwen layer weights are saved in a separate `qwen_state` key, distinct from `model_state` (encoder params):
+
+```python
+checkpoint = {
+    'model_state': {...},   # encoder params only (~50 MB)
+    'qwen_state':  {...},   # unfrozen Qwen layers (~4 GB)
+    'lora_state':  {},      # empty when using unfreeze
+    ...
+}
+```
+
+`model_state` and `qwen_state` are kept separate so intermediate step checkpoints can optionally skip `qwen_state` to save disk space, while `best_model.pt` always contains the full state.
+
+### Inference
+
+At inference time, `inference.py` auto-detects whether a checkpoint used unfreeze or LoRA by inspecting the checkpoint keys, and calls `unfreeze_layers()` or `enable_lora()` accordingly — no manual flag needed.
+
+### LoRA vs Unfreeze: When to Use Which
+
+| | LoRA | Full Unfreeze |
+|--|------|--------------|
+| VRAM | ~10 GB | ~25 GB |
+| Trainable params | ~2M | ~2B |
+| Expressiveness | Low | High |
+| Risk of forgetting | Low | Medium (mitigated by low lr) |
+| Best for | Limited GPU, many epochs | A100 40GB, new modality |
+
+### Usage
+
+```bash
+python -m train.train_full \
+    --s1_epochs 5 --s2_epochs 20 \
+    --unfreeze_layers 18 --qwen_lr 1e-5 \
+    --lr 3e-4 --s2_grad_accum 8
+```
+
+Pass `--unfreeze_layers 0` to fall back to LoRA.

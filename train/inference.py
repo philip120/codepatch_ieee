@@ -69,8 +69,20 @@ def load_model(checkpoint_path: str, lora_rank: int, lora_alpha: int,
                 loaded += 1
         print(f"Restored {loaded} encoder parameter tensors")
 
-    # Restore LoRA weights
-    if "lora_state" in ckpt and ckpt["lora_state"]:
+    # Restore LoRA or unfrozen Qwen weights
+    if "qwen_state" in ckpt and ckpt["qwen_state"]:
+        # Infer how many layers were unfrozen from the state dict keys
+        unfrozen_idxs = set()
+        for k in ckpt["qwen_state"]:
+            # keys look like "model.layers.24.self_attn.q_proj.weight"
+            parts = k.split(".")
+            if len(parts) > 2 and parts[0] == "model" and parts[1] == "layers":
+                unfrozen_idxs.add(int(parts[2]))
+        num_unfrozen = len(unfrozen_idxs)
+        model.decoder.unfreeze_layers(num_unfrozen)
+        model.decoder.load_unfrozen_state_dict(ckpt["qwen_state"])
+        print(f"Restored {len(ckpt['qwen_state'])} unfrozen Qwen tensors ({num_unfrozen} layers)")
+    elif "lora_state" in ckpt and ckpt["lora_state"]:
         model.enable_lora(
             rank=lora_rank,
             alpha=lora_alpha,
