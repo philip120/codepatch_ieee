@@ -707,3 +707,170 @@ python -m train.train_full \
 ```
 
 Pass `--unfreeze_layers 0` to fall back to LoRA.
+
+---
+
+## 19. Discovered Errors and Fixes
+
+This section documents bugs and architectural errors discovered during training, grouped by when they were found and what was done to correct them.
+
+---
+
+### 19.1 Training Approach 1 — LoRA Fine-Tuning (Single-Stage)
+
+The first training approach used a single stage: train the encoder pipeline (Projector, RvNN, PixelEmbedder) and Qwen LoRA adapters simultaneously from random initialization.
+
+**Error 1: OneCycleLR off-by-one crash**
+
+The scheduler was initialised with:
+```python
+total_steps = epochs * len(loader) // gradient_accumulation
+```
+Integer floor division undercounts by 1 whenever `epochs * len(loader)` is not divisible by `gradient_accumulation`. The scheduler then raised a `ValueError` ("Tried to step N+1 times") at the very last batch.
+
+Fix: replace with `math.ceil`:
+```python
+import math
+total_steps = math.ceil(epochs * len(loader) / gradient_accumulation)
+```
+
+**Error 2: FP16 gradient unscale crash with unfrozen Qwen layers**
+
+When the full-unfreeze approach was introduced, `GradScaler` raised:
+```
+ValueError: Attempting to unscale FP16 gradients
+```
+The unfrozen Qwen layers were loaded in `dtype=torch.float16`, and PyTorch's AMP scaler cannot unscale gradients of FP16 parameters (it is only designed for FP32 parameters with FP16 activations).
+
+Fix: load the entire Qwen model in `bfloat16` and disable the scaler:
+```python
+# QwenDecoder.__init__
+self.model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    dtype=torch.bfloat16 if self.device == "cuda" else torch.float32,
+)
+
+# training scripts
+scaler = torch.amp.GradScaler("cuda", enabled=False)
+```
+`bfloat16` has the same dynamic range as `float32`, so no loss scaling is needed. The NaN-loss that followed a previous float16 load was also caused by this dtype mismatch.
+
+**Error 3: Disk full — step checkpoints saved 18 GB each**
+
+Step checkpoints (saved every 100 steps) included `qwen_state` (~3.6 GB, 18 unfrozen layers) and `optimizer.state_dict()` (~14 GB for Adam m/v states on 2.2B parameters). Two saves filled the Colab disk.
+
+Fix: step checkpoints are now "lite" — encoder weights and scheduler only (~50 MB). `best_model.pt` (saved at most once per epoch when loss improves) includes `qwen_state` but skips optimizer state. Optimizer state is never saved with the unfreeze approach.
+
+**Error 4: Gradient clipping excluded unfrozen Qwen layers**
+
+The clip call used `model.get_trainable_parameters()`, which only returns encoder parameters plus LoRA params (via `decoder.get_lora_parameters()`). When unfreeze was active, LoRA was disabled and `get_lora_parameters()` returned an empty list — the 2.2B unfrozen Qwen parameters were never clipped.
+
+Fix: clip across all `requires_grad` parameters:
+```python
+all_trainable = [p for p in model.parameters() if p.requires_grad]
+torch.nn.utils.clip_grad_norm_(all_trainable, max_norm=1.0)
+```
+
+---
+
+### 19.2 Training Approach 2 — Two-Stage with Full Unfreeze
+
+The second approach introduced Stage 1 text-only pre-training and replaced LoRA with full layer unfreeze. The bugs above were fixed. However, a deeper architectural error was discovered by instrumenting projector output norms during training.
+
+---
+
+### 19.3 Critical Architectural Bug: Projector Output Scale Mismatch (45×)
+
+**The bug**
+
+The `Projector` ended with a `LayerNorm(out_dim)` layer:
+
+```python
+self.net = nn.Sequential(
+    nn.Linear(in_dim, bottleneck_dim),
+    nn.LayerNorm(bottleneck_dim),
+    nn.GELU(),
+    nn.Dropout(dropout),
+    nn.Linear(bottleneck_dim, out_dim),
+    nn.LayerNorm(out_dim),     # ← problem
+)
+```
+
+`LayerNorm` normalises its input to zero mean and unit variance per token. For a vector of dimension D = 2560, this forces the L2 norm to be:
+
+```
+‖x‖ = sqrt(D) ≈ sqrt(2560) ≈ 50.6
+```
+
+This is a mathematical invariant — no matter what the preceding Linear layer learns, the final `LayerNorm` always outputs vectors with norm ≈ 50. The projector **cannot** learn to produce embeddings at the right scale.
+
+**Why it matters**
+
+Qwen3-4B's embedding table produces token embeddings with norm ≈ 1.09 (measured: mean = 1.09, std = 0.17). The projected code prefix had norm ≈ 48.6. This is a **45× mismatch**.
+
+```
+Qwen token embedding norms:  mean = 1.09  std = 0.17
+Projected embedding norms:   mean = 48.6  std = 0.24
+```
+
+Diagnosed with `debug_encoder.py`:
+
+```bash
+python debug_encoder.py --checkpoint checkpoints_stage2/combined/best_model.pt
+```
+
+The consequence: Qwen's attention layers process the prefix tokens as signals 45× larger than normal text tokens. The prefix dominates the attention computation regardless of its actual semantic content — Qwen cannot distinguish a meaningful prefix signal from one that is pure noise at this scale.
+
+**Why generation still showed some structure**
+
+The discrimination check confirmed that different code samples do produce different projected vectors (cosine similarity 0.59–0.83). The encoder was not collapsed. However, the scale mismatch prevented the decoder from reliably using the content of those vectors.
+
+The generation at step ~7000 showed partial structural alignment (if-else code → if-else pseudocode structure) but wrong content, which is consistent with Qwen picking up coarse shape information from the prefix while ignoring fine-grained semantics.
+
+**The fix**
+
+Remove the final `LayerNorm` from the projector. The last `Linear(bottleneck_dim, out_dim)` can then learn to output vectors at whatever scale is needed — including the ~1.0 norm that Qwen expects:
+
+```python
+# Before (broken):
+self.net = nn.Sequential(
+    nn.Linear(in_dim, bottleneck_dim),
+    nn.LayerNorm(bottleneck_dim),
+    nn.GELU(),
+    nn.Dropout(dropout),
+    nn.Linear(bottleneck_dim, out_dim),
+    nn.LayerNorm(out_dim),    # ← removed
+)
+
+# After (fixed):
+self.net = nn.Sequential(
+    nn.Linear(in_dim, bottleneck_dim),
+    nn.LayerNorm(bottleneck_dim),
+    nn.GELU(),
+    nn.Dropout(dropout),
+    nn.Linear(bottleneck_dim, out_dim),
+)
+```
+
+With Kaiming initialisation on the final `Linear(768, 2560)`, the initial output norms will be on the order of 1–5, which is compatible with Qwen's expected input scale. During training, the weights will converge to the exact scale the decoder needs.
+
+**Note on existing checkpoints**
+
+Any checkpoint trained with the old projector (norm ~50) cannot be resumed and used directly with the fixed projector. The projector weights in those checkpoints learned a representation in the wrong scale regime. Stage 1 (Qwen-only) checkpoints are unaffected — the fix only changes the encoder pipeline.
+
+**What this means for the next training run**
+
+Stage 2 must restart from scratch. Stage 1 `best_model.pt` is still valid and should be used as the `--stage1_checkpoint`.
+
+```bash
+python -m train.train_full \
+    --skip_stage1 \
+    --stage1_checkpoint checkpoints_stage1/best_model.pt \
+    --s2_epochs 20 \
+    --unfreeze_layers 18 --qwen_lr 1e-5 \
+    --s2_lr 3e-4 --s2_grad_accum 8
+```
+
+**Precedent**
+
+LLaVA-1.5 (a production vision-language model) uses a simple two-layer MLP projector with no output normalisation. The final linear layer learns to produce visual tokens at the right scale for the frozen LLM decoder. The presence of `LayerNorm` at the projector output is a documented anti-pattern in multimodal LLM architectures precisely because it prevents scale adaptation.
