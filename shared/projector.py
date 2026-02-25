@@ -22,7 +22,12 @@ class Projector(nn.Module):
         → GELU
         → Dropout
         → Linear(bottleneck → out)
-        → LayerNorm
+
+    NOTE: No LayerNorm at the output. The final Linear learns to output
+    embeddings at the same scale as Qwen's token embeddings (~norm 1.0).
+    A final LayerNorm would fix norm at sqrt(out_dim) ≈ 50, which is 45×
+    larger than Qwen's expected input scale and prevents the projector from
+    adapting to the correct magnitude.
     """
 
     def __init__(
@@ -45,9 +50,8 @@ class Projector(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
 
-            # Expand to Qwen space
+            # Expand to Qwen space — no LayerNorm so network can learn correct scale
             nn.Linear(bottleneck_dim, out_dim),
-            nn.LayerNorm(out_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
