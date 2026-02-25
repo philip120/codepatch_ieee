@@ -22,13 +22,25 @@ class Projector(nn.Module):
         → GELU
         → Dropout
         → Linear(bottleneck → out)
+        → LayerNorm(out)
+        → learned scalar (output_scale)
 
-    NOTE: No LayerNorm at the output. The final Linear learns to output
-    embeddings at the same scale as Qwen's token embeddings (~norm 1.0).
-    A final LayerNorm would fix norm at sqrt(out_dim) ≈ 50, which is 45×
-    larger than Qwen's expected input scale and prevents the projector from
-    adapting to the correct magnitude.
+    The final LayerNorm normalises direction (unit-variance per token),
+    preventing feature collapse and keeping gradients stable. A single
+    learned scalar `output_scale` then controls the magnitude. It is
+    initialised to 0.022 ≈ 1.09 / 50, placing the initial projected norm
+    near Qwen3-4B's token embedding norm (~1.09). During training the
+    scalar adapts freely via gradient descent.
+
+    This avoids two failure modes:
+      - LayerNorm alone: norm fixed at sqrt(out_dim) ≈ 50 (45× too large,
+        cannot adapt)
+      - No LayerNorm: norm drifts upward during training (optimizer exploits
+        large norms to dominate the residual stream)
     """
+
+    # Qwen3-4B token embedding norm (measured: mean=1.09, std=0.17)
+    QWEN_TOKEN_NORM = 1.09
 
     def __init__(
         self,
@@ -43,16 +55,23 @@ class Projector(nn.Module):
         self.bottleneck_dim = bottleneck_dim
         self.out_dim = out_dim
 
+        import math
+        # LayerNorm output norm ≈ sqrt(out_dim); initial scale brings it to ~1.09
+        initial_scale = self.QWEN_TOKEN_NORM / math.sqrt(out_dim)  # ≈ 0.022
+
         self.net = nn.Sequential(
             # Compress
             nn.Linear(in_dim, bottleneck_dim),
             nn.LayerNorm(bottleneck_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-
-            # Expand to Qwen space — no LayerNorm so network can learn correct scale
+            # Expand to Qwen space
             nn.Linear(bottleneck_dim, out_dim),
+            nn.LayerNorm(out_dim),
         )
+
+        # Learned magnitude scalar — initialised so output norm ≈ Qwen token norm
+        self.output_scale = nn.Parameter(torch.tensor(initial_scale))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -62,9 +81,9 @@ class Projector(nn.Module):
             x: [num_patches, in_dim] patch embeddings
 
         Returns:
-            [num_patches, out_dim] projected embeddings
+            [num_patches, out_dim] projected embeddings with norm ≈ 1.09
         """
-        return self.net(x)
+        return self.net(x) * self.output_scale.abs()
 
     def num_parameters(self) -> int:
         """Return total trainable parameters."""

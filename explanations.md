@@ -874,3 +874,49 @@ python -m train.train_full \
 **Precedent**
 
 LLaVA-1.5 (a production vision-language model) uses a simple two-layer MLP projector with no output normalisation. The final linear layer learns to produce visual tokens at the right scale for the frozen LLM decoder. The presence of `LayerNorm` at the projector output is a documented anti-pattern in multimodal LLM architectures precisely because it prevents scale adaptation.
+
+---
+
+### 19.4 Second Fix Attempt: Removing LayerNorm — Norm Drift
+
+Removing the final `LayerNorm` was the first attempted fix. The projected norm at initialisation dropped from 50 to ~28, suggesting correct initial scale. However, during training the norm drifted upward:
+
+```
+step  100:  proj_norm = 28.9
+step  650:  proj_norm = 55.8
+step  750:  proj_norm = 64.9  ← higher than the original run with LayerNorm
+```
+
+**Why this happens:** Without any output constraint, the optimizer is free to increase the projector output magnitude as a proxy for "relevance". Larger projected vectors dominate Qwen's residual stream more strongly, which the optimizer exploits to reduce loss regardless of content quality. There is no penalty on large norms in the loss function. The result is norm drift that recreates and exceeds the original scale problem.
+
+Loss converged faster without LayerNorm (step 700: loss 1.4 vs ~1.7 in the original run), confirming that the higher proj_var (0.70 vs ~0.50) provided richer gradient signal — but the norm growth remained uncontrolled.
+
+**The correct fix: LayerNorm + learned scalar**
+
+The two failure modes require two different solutions:
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| Norm fixed at 50 (old) | `LayerNorm` pins magnitude to `sqrt(D)` | Replace fixed normalisation with learned scale |
+| Norm drift to ∞ (second attempt) | No output constraint → optimizer exploits scale | Keep `LayerNorm` for direction stability |
+
+The final architecture combines both: `LayerNorm(out_dim)` normalises direction (preventing collapse), followed by a single learned scalar `output_scale` that controls magnitude:
+
+```python
+self.net = nn.Sequential(
+    nn.Linear(in_dim, bottleneck_dim),
+    nn.LayerNorm(bottleneck_dim),
+    nn.GELU(),
+    nn.Dropout(dropout),
+    nn.Linear(bottleneck_dim, out_dim),
+    nn.LayerNorm(out_dim),        # stabilises direction
+)
+# Magnitude: initialised so output norm ≈ Qwen token norm (1.09)
+# output_scale = 1.09 / sqrt(2560) ≈ 0.022
+self.output_scale = nn.Parameter(torch.tensor(0.022))
+
+def forward(self, x):
+    return self.net(x) * self.output_scale.abs()
+```
+
+At initialisation, `proj_norm ≈ 50 × 0.022 ≈ 1.1` — matching Qwen's token norm. During training `output_scale` adapts freely via gradient descent, but the `LayerNorm` ensures that only the scalar (not the full weight matrix) adjusts the output magnitude, preventing uncontrolled drift.
