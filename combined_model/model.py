@@ -95,8 +95,8 @@ class CombinedSemanticViT(nn.Module):
         # preventing the single tree token from dominating Qwen's attention.
         import math
         self.tree_output_scale = nn.Parameter(
-            torch.tensor(Projector.QWEN_TOKEN_NORM / math.sqrt(qwen_dim))
-        ).to(DEVICE)
+            torch.tensor(Projector.QWEN_TOKEN_NORM / math.sqrt(qwen_dim), device=DEVICE)
+        )
 
     def get_trainable_parameters(self):
         """Return all encoder trainable parameters (excludes unfrozen Qwen layers)."""
