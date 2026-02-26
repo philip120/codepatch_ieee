@@ -55,23 +55,20 @@ class Projector(nn.Module):
         self.bottleneck_dim = bottleneck_dim
         self.out_dim = out_dim
 
-        import math
-        # LayerNorm output norm ≈ sqrt(out_dim); initial scale brings it to ~1.09
-        initial_scale = self.QWEN_TOKEN_NORM / math.sqrt(out_dim)  # ≈ 0.022
-
         self.net = nn.Sequential(
             # Compress
             nn.Linear(in_dim, bottleneck_dim),
             nn.LayerNorm(bottleneck_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            # Expand to Qwen space
+            # Expand to Qwen space — no final LayerNorm.
+            # A final LayerNorm pins norm to sqrt(out_dim) ≈ 50 (cannot adapt).
+            # A learned scalar output_scale to compensate damps projector gradients
+            # by 45× (output_scale ≈ 0.022), causing representation collapse
+            # (proj_var → 0). The linear layer learns the correct output scale
+            # directly via gradient descent with weight_decay keeping it bounded.
             nn.Linear(bottleneck_dim, out_dim),
-            nn.LayerNorm(out_dim),
         )
-
-        # Learned magnitude scalar — initialised so output norm ≈ Qwen token norm
-        self.output_scale = nn.Parameter(torch.tensor(initial_scale))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -81,9 +78,9 @@ class Projector(nn.Module):
             x: [num_patches, in_dim] patch embeddings
 
         Returns:
-            [num_patches, out_dim] projected embeddings with norm ≈ 1.09
+            [num_patches, out_dim] projected embeddings
         """
-        return self.net(x) * self.output_scale.abs()
+        return self.net(x)
 
     def num_parameters(self) -> int:
         """Return total trainable parameters."""

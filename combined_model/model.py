@@ -89,14 +89,6 @@ class CombinedSemanticViT(nn.Module):
             dropout=dropout
         ).to(DEVICE)
 
-        # Learned scale for tree path output — mirrors projector.output_scale.
-        # RecursiveEncoder combiner ends with LayerNorm so its output norm ≈ sqrt(qwen_dim) ≈ 50.
-        # This scalar brings the global_vector to the same scale as the ViT seq_vectors (~1.09),
-        # preventing the single tree token from dominating Qwen's attention.
-        import math
-        self.tree_output_scale = nn.Parameter(
-            torch.tensor(Projector.QWEN_TOKEN_NORM / math.sqrt(qwen_dim), device=DEVICE)
-        )
 
     def get_trainable_parameters(self):
         """Return all encoder trainable parameters (excludes unfrozen Qwen layers)."""
@@ -108,7 +100,6 @@ class CombinedSemanticViT(nn.Module):
         # Tree path
         params.extend(self.pixel_adapter.parameters())
         params.extend(self.recursive_encoder.parameters())
-        params.append(self.tree_output_scale)
         # LoRA (if enabled; empty list when using unfreeze)
         params.extend(self.decoder.get_lora_parameters())
         return params
@@ -168,11 +159,6 @@ class CombinedSemanticViT(nn.Module):
         )
 
         # --- FUSION ---
-        # Scale global_vector to match projector output norm (~1.09).
-        # RecursiveEncoder ends with LayerNorm so global_vector norm ≈ sqrt(qwen_dim) ≈ 50.
-        # Without scaling, position 0 is 45× louder than seq_vectors and dominates attention.
-        global_vector = global_vector * self.tree_output_scale.abs()
-
         # [1, qwen_dim] + [M, qwen_dim] -> [M+1, qwen_dim]
         combined = torch.cat([global_vector, seq_vectors], dim=0)
 
