@@ -161,13 +161,13 @@ class QwenDecoder:
         """Set Qwen to eval mode."""
         self.model.eval()
 
-    def get_input_embeddings(self, text: str) -> torch.Tensor:
+    def get_input_embeddings(self, text: str, max_length: int = 512) -> torch.Tensor:
         """Get Qwen's embeddings for text tokens."""
         tokens = self.tokenizer(
             text,
             return_tensors="pt",
             truncation=True,
-            max_length=256,
+            max_length=max_length,
             padding=True,
         ).to(self.device)
 

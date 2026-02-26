@@ -3,7 +3,6 @@ Recursive Encoder (RvNN) for Model 2
 
 Recursively aggregates tree-structured embeddings.
 """
-from turtle import clear
 import torch
 import torch.nn as nn
 from typing import List

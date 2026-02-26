@@ -13,6 +13,7 @@ def load_matlab_nl_dataset(split="train"):
     )
 
     examples = []
+    skipped_classdef = 0
 
     for row in ds:
         code = row.get("code")
@@ -21,9 +22,16 @@ def load_matlab_nl_dataset(split="train"):
         if not code or not nl:
             continue
 
+        if code.lstrip().startswith("classdef"):
+            skipped_classdef += 1
+            continue
+
         examples.append({
             "code": code,
             "nl": nl
         })
+
+    if skipped_classdef:
+        print(f"  Filtered {skipped_classdef} classdef samples")
 
     return examples
