@@ -158,9 +158,8 @@ class CombinedSemanticViT(nn.Module):
         )
 
         # --- FUSION ---
-        # Clamp global_vector norm to same ceiling as projector.
-        gv_norm = global_vector.norm(dim=-1, keepdim=True)
-        global_vector = global_vector * (3.0 / gv_norm).clamp(max=1.0)
+        # Normalise global_vector to unit norm, same as projector output.
+        global_vector = torch.nn.functional.normalize(global_vector, dim=-1)
 
         # [1, qwen_dim] + [M, qwen_dim] -> [M+1, qwen_dim]
         combined = torch.cat([global_vector, seq_vectors], dim=0)

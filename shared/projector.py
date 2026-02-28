@@ -46,11 +46,6 @@ class Projector(nn.Module):
 
         self.net = nn.Linear(in_dim, out_dim)
 
-    # Max-norm ceiling for projected tokens.
-    # Keeps output norms in a range Qwen can use (Qwen token norm ≈ 1.09).
-    # Set conservatively at 3.0 — acts only when norms start to explode.
-    MAX_NORM = 3.0
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Project patch embeddings to Qwen space.
@@ -59,16 +54,11 @@ class Projector(nn.Module):
             x: [num_patches, in_dim] patch embeddings
 
         Returns:
-            [num_patches, out_dim] projected embeddings
+            [num_patches, out_dim] projected embeddings, L2-normalised to unit norm
         """
+        import torch.nn.functional as F
         out = self.net(x)
-        # Max-norm clamp: scale DOWN tokens exceeding MAX_NORM, never scale up.
-        # Below the ceiling, scale=1.0 so gradients are completely unaffected.
-        # Only when a token's norm is actively growing past the ceiling does
-        # this engage — preventing runaway norm drift without dampening learning.
-        norms = out.norm(dim=-1, keepdim=True)
-        scale = (self.MAX_NORM / norms).clamp(max=1.0)
-        return out * scale
+        return F.normalize(out, dim=-1)  # fix norm=1, Qwen token norm ≈ 1.09
 
     def num_parameters(self) -> int:
         """Return total trainable parameters."""
