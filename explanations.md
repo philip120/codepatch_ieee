@@ -920,3 +920,121 @@ def forward(self, x):
 ```
 
 At initialisation, `proj_norm ≈ 50 × 0.022 ≈ 1.1` — matching Qwen's token norm. During training `output_scale` adapts freely via gradient descent, but the `LayerNorm` ensures that only the scalar (not the full weight matrix) adjusts the output magnitude, preventing uncontrolled drift.
+
+---
+
+### 19.5 Third Fix Attempt: LayerNorm + output_scale → Gradient Dampening, Representation Collapse
+
+The LayerNorm + learned scalar approach appeared correct in theory but failed in practice due to gradient dampening.
+
+**The failure**
+
+After ~300 training steps, `proj_var` (variance across the projected token dimensions) collapsed to near zero:
+
+```
+step 310:  proj_var = 0.000077,  proj_norm = 1.22
+step 350:  proj_var = 0.000081,  proj_norm = 1.24
+```
+
+The projector was outputting nearly identical vectors for all code samples — all semantic content was lost. Generation degraded to repetitive filler text regardless of input.
+
+**Why this happens: gradient dampening**
+
+The `output_scale` is initialised to 0.022 to match Qwen's token norm. This scalar sits at the very end of the forward pass. By the chain rule, every gradient flowing back through the projector is multiplied by `output_scale`:
+
+```
+∂L/∂W_projector = (∂L/∂output) × output_scale × (∂output/∂W_projector)
+                ≈ grad × 0.022 × ...
+```
+
+The projector weight matrix receives gradients 45× smaller than they would be without the scalar. This is too small for the optimizer to make meaningful updates. The projector stagnates, all outputs converge toward the same direction (the LayerNorm mean), and `proj_var → 0`.
+
+The scalar itself (`output_scale`) does receive a useful gradient and adapts, but it is a single number — it can only control the global magnitude, not the content of the projected embeddings.
+
+**Summary of three failed fixes**
+
+| Attempt | Change | Initial norm | Problem |
+|---------|--------|--------------|---------|
+| Original | `LayerNorm(out_dim)` at end | ≈ 50 | 45× too large, decoder ignores content |
+| 2nd | Remove final `LayerNorm` | ≈ 28 | Drifts to 65 by step 750 |
+| 3rd | `LayerNorm` + `output_scale=0.022` | ≈ 1.1 | Gradient dampened 45×, proj_var → 0 |
+
+All three approaches tried to fix the same symptom (wrong output norm) while keeping the bottleneck MLP architecture. The root cause is the MLP itself: its depth and the LayerNorm interaction create constraints that cannot be cleanly resolved.
+
+---
+
+### 19.6 Final Fix: Single Linear Projector
+
+**Insight from earlier work**
+
+An earlier prototype (`codepatch-paligemma`) used a single `Linear(768, 2048)` projector — one per semantic statement, no bottleneck, no LayerNorm. That model trained stably. The key difference: a single linear layer with Kaiming init produces a naturally correct output norm with no additional machinery.
+
+**The fix**
+
+Replace the entire bottleneck MLP with a single linear layer in all projection points:
+
+*`shared/projector.py`:*
+```python
+# Before (bottleneck MLP — all three fixes failed):
+self.net = nn.Sequential(
+    nn.Linear(in_dim, bottleneck_dim),
+    nn.LayerNorm(bottleneck_dim),
+    nn.GELU(),
+    nn.Dropout(dropout),
+    nn.Linear(bottleneck_dim, out_dim),
+    # ± LayerNorm(out_dim), ± output_scale
+)
+
+# After (single linear):
+self.net = nn.Linear(in_dim, out_dim)   # 3072 → 2560
+```
+
+*`combined_model/model.py` — pixel_adapter (tree path):*
+```python
+# Before:
+self.pixel_adapter = nn.Sequential(
+    nn.Linear(768, qwen_dim),
+    nn.LayerNorm(qwen_dim),   # ← same norm≈50 problem
+    nn.GELU()
+)
+
+# After:
+self.pixel_adapter = nn.Linear(768, qwen_dim)
+```
+
+*`model2/recursive_encoder.py` — child_aggregator and combiner:*
+```python
+# Before: child_aggregator ended with nn.LayerNorm(embed_dim)
+# After:  removed — last layer is nn.Linear(hidden_dim, embed_dim)
+
+# Before: combiner = nn.Sequential(nn.Linear(embed_dim*2, embed_dim), nn.LayerNorm(embed_dim))
+# After:  combiner = nn.Linear(embed_dim * 2, embed_dim)
+```
+
+**Why the tree path needed the same fix**
+
+With the projector fixed to norm ≈ 1.29, leaving the tree path's `pixel_adapter + RecursiveEncoder` with their final `LayerNorm`s would produce a `global_vector` still at norm ≈ 50. The combined tensor `[global_vector, seq_vectors]` would have a 40× norm imbalance between the structural token and the sequential tokens, causing Qwen to weight the structural token almost exclusively.
+
+**Why Kaiming init produces the correct norm**
+
+For `Linear(3072, 2560)` with Kaiming uniform init and unit-normal input:
+```
+output std ≈ sqrt(2 / fan_in) = sqrt(2 / 3072) ≈ 0.026  (per element)
+output norm ≈ sqrt(out_dim) × 0.026 × sqrt(3072/3072)
+            = sqrt(2560 × 2 / 3072) ≈ 1.29
+```
+This is within 20% of Qwen's token norm (1.09) at initialisation — no scaling, no normalisation, no additional parameters needed. During training the weights adapt freely to whatever scale the decoder requires.
+
+For `Linear(768, 2560)` (pixel_adapter):
+```
+output norm ≈ sqrt(2560 × 2 / 768) ≈ 2.58
+```
+Still within 3× of 1.09 — acceptable initial condition, adapts during training.
+
+**Precedent**
+
+LLaVA-1.5 uses a two-layer MLP projector with no output normalisation; LLaVA-1.0 uses a single linear projector. Neither uses output LayerNorm. The absence of output normalisation in production multimodal projectors reflects the same lesson: the final linear layer should learn the correct output scale directly.
+
+**Novel contribution preserved**
+
+The single linear change affects only the internal projector implementation. The ViT-for-code patching concept (PatchEmbedder grouping N semantic pixels into M patches, then projecting M patches to Qwen space) remains intact and architecturally distinct from the earlier per-statement encoding approach.

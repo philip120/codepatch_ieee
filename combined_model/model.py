@@ -76,11 +76,10 @@ class CombinedSemanticViT(nn.Module):
         ).to(DEVICE)
 
         # --- PATH 2: STRUCTURAL (RvNN) ---
-        self.pixel_adapter = nn.Sequential(
-            nn.Linear(768, qwen_dim),
-            nn.LayerNorm(qwen_dim),
-            nn.GELU()
-        ).to(DEVICE)
+        # No LayerNorm: same reason as projector — pins norm to sqrt(qwen_dim)≈50.
+        # Kaiming init on Linear(768, qwen_dim) gives output norm ≈ sqrt(2*qwen_dim/768) ≈ 2.6,
+        # which is close enough to Qwen token norms (~1.09).
+        self.pixel_adapter = nn.Linear(768, qwen_dim).to(DEVICE)
 
         self.recursive_encoder = RecursiveEncoder(
             embed_dim=qwen_dim,

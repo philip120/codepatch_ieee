@@ -26,21 +26,19 @@ class RecursiveEncoder(nn.Module):
         # 1. Aggregate children -> Child_Summary
         # 2. Combine Child_Summary + Parent_Self -> New_Parent
         
-        # MLP to aggregate children
+        # MLP to aggregate children.
+        # No final LayerNorm: would pin output norm to sqrt(embed_dim)≈50,
+        # causing the global_vector to dominate Qwen's residual stream.
         self.child_aggregator = nn.Sequential(
             nn.Linear(max_branching * embed_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, embed_dim),
-            nn.LayerNorm(embed_dim)
         )
-        
-        # Combiner: Parent + Child_Summary
-        self.combiner = nn.Sequential(
-            nn.Linear(embed_dim * 2, embed_dim),
-            nn.LayerNorm(embed_dim)
-        )
+
+        # Combiner: Parent + Child_Summary. No final LayerNorm for same reason.
+        self.combiner = nn.Linear(embed_dim * 2, embed_dim)
         
     def aggregate_children(self, child_vectors: torch.Tensor, debug: bool = False) -> torch.Tensor:
         """
