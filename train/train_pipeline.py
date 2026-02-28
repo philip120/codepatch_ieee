@@ -166,18 +166,20 @@ def train(
         base_params = [p for p in model.get_trainable_parameters() if id(p) not in lora_ids]
         lora_params = list(model.decoder.get_lora_parameters())
         optimizer = torch.optim.AdamW([
-            {'params': base_params, 'lr': lr},
-            {'params': lora_params, 'lr': lora_lr},
-        ], weight_decay=weight_decay)
+            {'params': base_params, 'lr': lr, 'weight_decay': 0.0},
+            {'params': lora_params, 'lr': lora_lr, 'weight_decay': weight_decay},
+        ])
         print(f"\nParam groups: encoder ({len(base_params)} tensors, lr={lr}) "
               f"+ LoRA ({len(lora_params)} tensors, lr={lora_lr})")
     elif unfreeze_layers > 0:
         encoder_params = model.get_trainable_parameters()
         qwen_params = model.decoder.get_unfrozen_parameters()
         optimizer = torch.optim.AdamW([
-            {'params': encoder_params, 'lr': lr},
-            {'params': qwen_params, 'lr': qwen_lr},
-        ], weight_decay=weight_decay)
+            # No weight_decay for encoder: with F.normalize in the projector,
+            # weight_decay pushes W→0, collapsing all outputs to bias direction.
+            {'params': encoder_params, 'lr': lr, 'weight_decay': 0.0},
+            {'params': qwen_params, 'lr': qwen_lr, 'weight_decay': weight_decay},
+        ])
         print(f"\nParam groups: encoder ({len(encoder_params)} tensors, lr={lr}) "
               f"+ Qwen unfrozen ({len(qwen_params)} tensors, lr={qwen_lr})")
     else:
