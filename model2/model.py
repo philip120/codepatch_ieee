@@ -51,11 +51,9 @@ class StructuralModel(nn.Module):
         qwen_dim = self.decoder.hidden_size
 
         # Adapt pixel (768) to Recursive dim
-        self.pixel_adapter = nn.Sequential(
-            nn.Linear(768, qwen_dim),
-            nn.LayerNorm(qwen_dim),
-            nn.GELU()
-        ).to(DEVICE)
+        # No LayerNorm: would pin output norm to sqrt(qwen_dim)≈50,
+        # causing the global_vector to dominate Qwen's residual stream.
+        self.pixel_adapter = nn.Linear(768, qwen_dim).to(DEVICE)
 
         # Recursive Encoder (tree aggregation)
         self.recursive_encoder = RecursiveEncoder(

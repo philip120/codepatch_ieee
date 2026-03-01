@@ -175,8 +175,6 @@ def train(
         encoder_params = model.get_trainable_parameters()
         qwen_params = model.decoder.get_unfrozen_parameters()
         optimizer = torch.optim.AdamW([
-            # No weight_decay for encoder: with F.normalize in the projector,
-            # weight_decay pushes W→0, collapsing all outputs to bias direction.
             {'params': encoder_params, 'lr': lr, 'weight_decay': 0.0},
             {'params': qwen_params, 'lr': qwen_lr, 'weight_decay': weight_decay},
         ])

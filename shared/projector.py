@@ -54,11 +54,9 @@ class Projector(nn.Module):
             x: [num_patches, in_dim] patch embeddings
 
         Returns:
-            [num_patches, out_dim] projected embeddings, L2-normalised to unit norm
+            [num_patches, out_dim] projected embeddings
         """
-        import torch.nn.functional as F
-        out = self.net(x)
-        return F.normalize(out, dim=-1)  # fix norm=1, Qwen token norm ≈ 1.09
+        return self.net(x)
 
     def num_parameters(self) -> int:
         """Return total trainable parameters."""

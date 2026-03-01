@@ -1038,3 +1038,59 @@ LLaVA-1.5 uses a two-layer MLP projector with no output normalisation; LLaVA-1.0
 **Novel contribution preserved**
 
 The single linear change affects only the internal projector implementation. The ViT-for-code patching concept (PatchEmbedder grouping N semantic pixels into M patches, then projecting M patches to Qwen space) remains intact and architecturally distinct from the earlier per-statement encoding approach.
+
+---
+
+### 19.7 Root Cause Analysis: Why Earlier Prototype Worked, Why Current Does Not
+
+After comparing the current codebase against the earlier `codepatch-paligemma` prototype, the following table summarises the architectural differences:
+
+| | codepatch-paligemma (worked) | Current (broken) |
+|--|------------------------------|-----------------|
+| LLM | Gemma-2B (2048-dim, multimodal-friendly) | Qwen3-4B (2560-dim, text-only) |
+| Encoder LR | **2e-5** | 3e-4 (15× higher) |
+| LoRA LR | **2e-5** | 1e-4 (5× higher) |
+| LoRA rank / alpha | rank=8, alpha=32 | rank=16, alpha=128 |
+| Normalization | **None** | F.normalize → collapse |
+| Patch strategy | 1 token per semantic patch (CLS) | 4 statements concatenated → 1 token |
+| Two-stage training | No — single stage | Yes (but Stage 1 was dropped in latest run) |
+| proj_var collapse | Did not occur | Occurred in every normalized run |
+
+**The two reasons old worked and new does not:**
+
+1. **Learning rate 2e-5 prevented norm drift.** With LR=3e-4 (15× higher), the projector weights update aggressively every step. Without any output constraint the norms explode to 200+ within 750 steps. With LR=2e-5 the drift is ~15× slower — norms stay in the 5–20 range over the same number of steps, which is manageable without any normalization at all.
+
+2. **No normalization, no collapse.** Every attempt to constrain the output norm introduced a new failure:
+   - `LayerNorm` at output → pins norm to 50 (45× mismatch)
+   - `LayerNorm` + learned scalar → gradient dampened 45× → `proj_var → 0`
+   - Max-norm clamp at 3.0 → same dampening, same collapse
+   - `F.normalize` (unit norm) → weight decay pushes W→0 → all outputs converge to bias direction → `proj_var → 0.00005`
+
+   The old prototype used **no normalization and low LR**. The slow weight updates meant norms never grew fast enough to become a problem, so the linear layer learned useful directions naturally.
+
+3. **Per-statement encoding avoids within-sample collapse.** With patch_size=4, four adjacent statements from the same function are concatenated (3072-dim). Adjacent statements are semantically similar in CodeBERT space → similar 3072-dim vectors → similar projector outputs → within-sample `proj_var ≈ 0`. With patch_size=1 each statement gets its own token, and different statement types (`clear all` vs `for i=1:N` vs `x = sin(theta)`) produce genuinely different CodeBERT embeddings → more diverse projector outputs.
+
+---
+
+### 19.8 Final Training Configuration: Matching the Prototype
+
+**Changes made:**
+
+1. `shared/projector.py`: Removed `F.normalize` — forward pass is now `return self.net(x)` (plain linear).
+2. `train/train_pipeline.py`: Encoder weight_decay already set to 0.0 (from Section 19.7 fix). Kept.
+3. Command-line: LR lowered to 2e-5 for both encoder and LoRA, rank=8, alpha=32, grad_accum=4, patch_size=1 — matching the prototype's hyperparameters while keeping Qwen3-4B.
+
+**Training command:**
+
+```bash
+python -m train.train_pipeline \
+    --model combined --epochs 20 \
+    --lora --lora_rank 8 --lora_alpha 32 --lora_layers 12 --lora_lr 2e-5 \
+    --grad_accum 4 --lr 2e-5 \
+    --dropout 0.05 --bottleneck 768 \
+    --patch_size 1 \
+    --save_every 1000 \
+    --save_dir checkpoints_stage2
+```
+
+**Expected behaviour:** With LR=2e-5, `proj_norm` should stay below 10 for the first 2000 steps (vs 254 with LR=3e-4). `proj_var` should be non-zero since there is no normalization to cause collapse. No Stage 1 checkpoint — single-stage training matching the prototype. The tree path (RecursiveEncoder + global_vector) is an addition not present in the prototype and constitutes the novel architectural contribution.

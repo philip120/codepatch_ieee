@@ -103,10 +103,6 @@ class CombinedSemanticViT(nn.Module):
         params.extend(self.decoder.get_lora_parameters())
         return params
 
-    def num_trainable_parameters(self):
-        """Total trainable parameters including unfrozen Qwen layers."""
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
-
     def enable_lora(self, **kwargs):
         """Enable LoRA on the Qwen decoder."""
         self.decoder.enable_lora(**kwargs)
@@ -158,9 +154,6 @@ class CombinedSemanticViT(nn.Module):
         )
 
         # --- FUSION ---
-        # Normalise global_vector to unit norm, same as projector output.
-        global_vector = torch.nn.functional.normalize(global_vector, dim=-1)
-
         # [1, qwen_dim] + [M, qwen_dim] -> [M+1, qwen_dim]
         combined = torch.cat([global_vector, seq_vectors], dim=0)
 
