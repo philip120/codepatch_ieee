@@ -1094,3 +1094,77 @@ python -m train.train_pipeline \
 ```
 
 **Expected behaviour:** With LR=2e-5, `proj_norm` should stay below 10 for the first 2000 steps (vs 254 with LR=3e-4). `proj_var` should be non-zero since there is no normalization to cause collapse. No Stage 1 checkpoint — single-stage training matching the prototype. The tree path (RecursiveEncoder + global_vector) is an addition not present in the prototype and constitutes the novel architectural contribution.
+
+---
+
+### 19.9 Post-Prototype Comparison Audit — Four Remaining Bugs
+
+A systematic comparison of the current codebase against the `codepatch-paligemma` prototype revealed four bugs that survived all previous fix rounds. All four were fixed simultaneously.
+
+---
+
+**Bug 1: `F.normalize` on `global_vector` (`combined_model/model.py`)**
+
+The combined model applied `F.normalize(global_vector, dim=-1)` before concatenating the tree path output with the sequential path output. This pinned the global_vector to unit norm (1.0), while the sequential tokens from the projector had freely-adapted norms (~1.29 at init, unconstrained during training).
+
+This is the same class of normalization bug documented in sections 19.3–19.6. The comment next to the line said "same as projector output", but the projector output is a plain `nn.Linear` with no normalization — the comment was wrong.
+
+Consequences:
+- **Scale mismatch** between the tree token (norm=1.0) and sequential tokens (norm=free) in the `[M+1, D]` tensor fed to Qwen.
+- **Gradient constraint** on the RvNN path — the recursive_encoder and pixel_adapter could not learn to produce embeddings at whatever scale Qwen requires, because `F.normalize` erased their learned magnitude every forward pass.
+
+Fix: removed the `F.normalize` line entirely. The tree path now produces freely-scaled embeddings, matching the projector's design.
+
+---
+
+**Bug 2: `LayerNorm` in `model2/model.py` pixel_adapter**
+
+The tree-only ablation model (`model2/model.py`) still used:
+
+```python
+self.pixel_adapter = nn.Sequential(
+    nn.Linear(768, qwen_dim),
+    nn.LayerNorm(qwen_dim),   # ← norm≈50 problem
+    nn.GELU()
+)
+```
+
+The combined model's pixel_adapter was correctly fixed to `nn.Linear(768, qwen_dim)` in section 19.6, but the same fix was never propagated to model2. This meant the tree-only ablation baseline still suffered from the 45× norm mismatch, making any ablation comparison (Combined vs Tree-Only) invalid.
+
+Fix: replaced with `nn.Linear(768, qwen_dim)`, matching the combined model.
+
+---
+
+**Bug 3: Duplicate `num_trainable_parameters` in `combined_model/model.py`**
+
+Two methods with the same name existed:
+
+```python
+# First (line 106): counts ALL requires_grad params
+def num_trainable_parameters(self):
+    return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+# Second (line 125): counts only get_trainable_parameters()
+def num_trainable_parameters(self):
+    return sum(p.numel() for p in self.get_trainable_parameters())
+```
+
+Python's method resolution means the second definition silently overrides the first. `get_trainable_parameters()` excludes unfrozen Qwen layers (it only returns encoder + LoRA params), so when using `--unfreeze_layers`, the parameter count printed during training would undercount by ~2 billion parameters.
+
+Fix: removed the first definition. The remaining method via `get_trainable_parameters()` is the one used consistently across all model variants.
+
+---
+
+**Bug 4: Stale comment in `train_pipeline.py`**
+
+The unfreeze branch of the optimizer setup contained:
+
+```python
+# No weight_decay for encoder: with F.normalize in the projector,
+# weight_decay pushes W→0, collapsing all outputs to bias direction.
+{'params': encoder_params, 'lr': lr, 'weight_decay': 0.0},
+```
+
+The projector no longer uses `F.normalize` (removed in section 19.8). The comment was stale and misleading. The `weight_decay=0.0` for encoder params may or may not still be optimal — it was originally set to fix a bug that no longer exists — but the comment incorrectly implied the fix was still needed for a current reason.
+
+Fix: removed the stale comment.
