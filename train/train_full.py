@@ -66,7 +66,9 @@ if __name__ == "__main__":
     parser.add_argument("--s2_resume", type=str, default=None,
                         help="Resume Stage 2 from this checkpoint")
 
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-4B-Instruct-2507")
+    parser.add_argument("--decoder", type=str, default="qwen",
+                        choices=["gemma", "qwen"],
+                        help="Decoder model: gemma or qwen")
     parser.add_argument("--split", type=str, default="train")
 
     args = parser.parse_args()
@@ -95,7 +97,7 @@ if __name__ == "__main__":
             save_dir=args.s1_save_dir,
             split=args.split,
             resume=args.s1_resume,
-            model_name=args.model_name,
+            decoder_name=args.decoder,
             unfreeze_layers=args.unfreeze_layers,
         )
     else:
@@ -132,6 +134,7 @@ if __name__ == "__main__":
         eval_samples=50,
         resume=args.s2_resume,
         stage1_checkpoint=s1_best,
+        decoder_name=args.decoder,
     )
 
     print("\n" + "#" * 60)

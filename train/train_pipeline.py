@@ -36,7 +36,7 @@ if DEVICE == "cuda":
     torch.backends.cudnn.benchmark = True
 
 
-def create_model(model_type: str, patch_size: int, bottleneck_dim: int, dropout: float):
+def create_model(model_type: str, patch_size: int, bottleneck_dim: int, dropout: float, decoder_name: str = "qwen"):
     """Create model based on type selection."""
     if model_type == "vit":
         from model.model import SemanticViT
@@ -44,11 +44,13 @@ def create_model(model_type: str, patch_size: int, bottleneck_dim: int, dropout:
             patch_size=patch_size,
             bottleneck_dim=bottleneck_dim,
             dropout=dropout,
+            decoder_name=decoder_name,
         )
     elif model_type == "tree":
         from model2.model import StructuralModel
         return StructuralModel(
             dropout=dropout,
+            decoder_name=decoder_name,
         )
     elif model_type == "combined":
         from combined_model.model import CombinedSemanticViT
@@ -56,6 +58,7 @@ def create_model(model_type: str, patch_size: int, bottleneck_dim: int, dropout:
             patch_size=patch_size,
             bottleneck_dim=bottleneck_dim,
             dropout=dropout,
+            decoder_name=decoder_name,
         )
     else:
         raise ValueError(f"Unknown model type: {model_type}. Use 'vit', 'tree', or 'combined'.")
@@ -90,6 +93,7 @@ def train(
     stage1_checkpoint: str = None,
     unfreeze_layers: int = 0,
     qwen_lr: float = 1e-5,
+    decoder_name: str = "qwen",
 ):
     """Main training function."""
     print("=" * 60)
@@ -97,6 +101,7 @@ def train(
     print("=" * 60)
     print(f"Device: {DEVICE}")
     print(f"Model: {model_type}")
+    print(f"Decoder: {decoder_name}")
     print(f"Epochs: {epochs}")
     print(f"Learning rate: {lr}")
     print(f"Weight decay: {weight_decay}")
@@ -107,7 +112,7 @@ def train(
     print(f"Mixed precision (AMP): {DEVICE == 'cuda'}")
     print(f"LoRA: {lora} (rank={lora_rank}, alpha={lora_alpha}, layers={lora_layers}, lora_lr={lora_lr})")
     if unfreeze_layers > 0:
-        print(f"Unfreeze: last {unfreeze_layers} Qwen layers (qwen_lr={qwen_lr})")
+        print(f"Unfreeze: last {unfreeze_layers} decoder layers (qwen_lr={qwen_lr})")
     if resume:
         print(f"Resuming from: {resume}")
 
@@ -128,7 +133,7 @@ def train(
     # Create model
     print("\n" + "=" * 60)
     print("Creating model...")
-    model = create_model(model_type, patch_size, bottleneck_dim, dropout)
+    model = create_model(model_type, patch_size, bottleneck_dim, dropout, decoder_name)
 
     # Enable LoRA or unfreeze Qwen layers before optimizer construction
     if lora:
@@ -343,6 +348,7 @@ def train(
                         'step': global_step,
                         'epoch': epoch,
                         'model_type': model_type,
+                        'decoder_name': decoder_name,
                         'model_state': {
                             name: param.data
                             for name, param in model.named_parameters()
@@ -370,6 +376,7 @@ def train(
                 'step': global_step,
                 'epoch': epoch,
                 'model_type': model_type,
+                'decoder_name': decoder_name,
                 'model_state': {
                     name: param.data
                     for name, param in model.named_parameters()
@@ -547,12 +554,17 @@ if __name__ == "__main__":
     parser.add_argument("--save_dir", type=str, default="checkpoints")
     parser.add_argument("--grad_accum", type=int, default=2)
 
+    # Decoder
+    parser.add_argument("--decoder", type=str, default="qwen",
+                        choices=["gemma", "qwen"],
+                        help="Decoder model: gemma (Gemma-2B) or qwen (Qwen3-4B)")
+
     # LoRA
-    parser.add_argument("--lora", action="store_true", help="Enable LoRA on Qwen decoder")
+    parser.add_argument("--lora", action="store_true", help="Enable LoRA on decoder")
     parser.add_argument("--lora_rank", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
-    parser.add_argument("--lora_layers", type=int, default=6, help="Number of last Qwen layers to apply LoRA")
+    parser.add_argument("--lora_layers", type=int, default=6, help="Number of last decoder layers to apply LoRA")
     parser.add_argument("--lora_lr", type=float, default=1e-4, help="Separate LR for LoRA params (lower than base)")
     parser.add_argument("--eval_samples", type=int, default=50, help="Number of samples for BLEU eval")
 
@@ -563,9 +575,9 @@ if __name__ == "__main__":
 
     # Full fine-tuning (alternative to LoRA)
     parser.add_argument("--unfreeze_layers", type=int, default=0,
-                        help="Unfreeze last N Qwen layers fully (replaces LoRA). 18 recommended for A100 40GB.")
+                        help="Unfreeze last N decoder layers fully (replaces LoRA)")
     parser.add_argument("--qwen_lr", type=float, default=1e-5,
-                        help="LR for unfrozen Qwen layers (much lower than encoder lr to avoid forgetting)")
+                        help="LR for unfrozen decoder layers (much lower than encoder lr to avoid forgetting)")
 
     args = parser.parse_args()
 
@@ -594,4 +606,5 @@ if __name__ == "__main__":
         stage1_checkpoint=args.stage1_checkpoint,
         unfreeze_layers=args.unfreeze_layers,
         qwen_lr=args.qwen_lr,
+        decoder_name=args.decoder,
     )

@@ -40,24 +40,29 @@ end
 
 def load_model(checkpoint_path: str, lora_rank: int, lora_alpha: int,
                lora_dropout: float, lora_layers: int,
-               patch_size: int, bottleneck_dim: int, dropout: float):
+               patch_size: int, bottleneck_dim: int, dropout: float,
+               decoder_name: str = None):
     """Load model + weights from a Stage 2 checkpoint."""
     print(f"Loading checkpoint: {checkpoint_path}")
     ckpt = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
 
     model_type = ckpt.get("model_type", "combined")
-    print(f"Model type: {model_type}")
+    # Auto-detect decoder from checkpoint, with CLI override
+    decoder_name = decoder_name or ckpt.get("decoder_name", "qwen")
+    print(f"Model type: {model_type}, Decoder: {decoder_name}")
 
     # Build model
     if model_type == "vit":
         from model.model import SemanticViT
-        model = SemanticViT(patch_size=patch_size, bottleneck_dim=bottleneck_dim, dropout=dropout)
+        model = SemanticViT(patch_size=patch_size, bottleneck_dim=bottleneck_dim,
+                            dropout=dropout, decoder_name=decoder_name)
     elif model_type == "tree":
         from model2.model import StructuralModel
-        model = StructuralModel(dropout=dropout)
+        model = StructuralModel(dropout=dropout, decoder_name=decoder_name)
     else:
         from combined_model.model import CombinedSemanticViT
-        model = CombinedSemanticViT(patch_size=patch_size, bottleneck_dim=bottleneck_dim, dropout=dropout)
+        model = CombinedSemanticViT(patch_size=patch_size, bottleneck_dim=bottleneck_dim,
+                                    dropout=dropout, decoder_name=decoder_name)
 
     # Restore trainable encoder weights
     if "model_state" in ckpt:
@@ -181,6 +186,9 @@ if __name__ == "__main__":
     parser.add_argument("--patch_size", type=int, default=4)
     parser.add_argument("--bottleneck", type=int, default=768)
     parser.add_argument("--dropout", type=float, default=0.05)
+    parser.add_argument("--decoder", type=str, default=None,
+                        choices=["gemma", "qwen"],
+                        help="Decoder model (auto-detected from checkpoint if not specified)")
 
     args = parser.parse_args()
 
@@ -193,6 +201,7 @@ if __name__ == "__main__":
         patch_size=args.patch_size,
         bottleneck_dim=args.bottleneck,
         dropout=args.dropout,
+        decoder_name=args.decoder,
     )
 
     if args.eval:

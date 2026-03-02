@@ -22,7 +22,7 @@ from shared.pixel_embedder import PixelEmbedder
 from shared.patch_embedder import PatchEmbedder
 from shared.projector import Projector
 from shared.semantic_extractor import MAX_DEPTH, NUM_TYPES
-from shared.qwen_decoder import QwenDecoder
+from shared.decoder_factory import create_decoder
 from model2.recursive_encoder import RecursiveEncoder
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -47,6 +47,7 @@ class CombinedSemanticViT(nn.Module):
         patch_size: int = 4,
         bottleneck_dim: int = 512,
         dropout: float = 0.4,
+        decoder_name: str = "qwen",
     ):
         super().__init__()
 
@@ -63,28 +64,29 @@ class CombinedSemanticViT(nn.Module):
         ).to(DEVICE)
 
         # --- DECODER (created first so we can read hidden_size) ---
-        self.decoder = QwenDecoder(device=DEVICE)
-        qwen_dim = self.decoder.hidden_size
+        self.decoder = create_decoder(decoder_name, device=DEVICE)
+        dec_dim = self.decoder.hidden_size
 
         # --- PATH 1: SEQUENTIAL (ViT) ---
         self.patch_embedder = PatchEmbedder(patch_size=patch_size)
         self.projector = Projector(
             in_dim=patch_size * 768,
             bottleneck_dim=bottleneck_dim,
-            out_dim=qwen_dim,
+            out_dim=dec_dim,
             dropout=dropout
         ).to(DEVICE)
 
         # --- PATH 2: STRUCTURAL (RvNN) ---
-        # No LayerNorm: same reason as projector — pins norm to sqrt(qwen_dim)≈50.
-        # Kaiming init on Linear(768, qwen_dim) gives output norm ≈ sqrt(2*qwen_dim/768) ≈ 2.6,
-        # which is close enough to Qwen token norms (~1.09).
-        self.pixel_adapter = nn.Linear(768, qwen_dim).to(DEVICE)
+        # No LayerNorm: pins norm to sqrt(dec_dim), causing the global_vector
+        # to dominate the decoder's residual stream.
+        # Kaiming init on Linear(768, dec_dim) gives output norm close to
+        # decoder token norms.
+        self.pixel_adapter = nn.Linear(768, dec_dim).to(DEVICE)
 
         self.recursive_encoder = RecursiveEncoder(
-            embed_dim=qwen_dim,
+            embed_dim=dec_dim,
             max_branching=8,
-            hidden_dim=qwen_dim * 2,
+            hidden_dim=dec_dim * 2,
             dropout=dropout
         ).to(DEVICE)
 

@@ -14,7 +14,7 @@ from shared.codebert_encoder import CodeBERTEncoder
 from shared.pixel_embedder import PixelEmbedder
 from shared.patch_embedder import PatchEmbedder
 from shared.projector import Projector
-from shared.qwen_decoder import QwenDecoder
+from shared.decoder_factory import create_decoder
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -32,6 +32,7 @@ class SemanticViT(nn.Module):
         patch_size: int = 4,
         bottleneck_dim: int = 512,
         dropout: float = 0.4,
+        decoder_name: str = "qwen",
     ):
         super().__init__()
 
@@ -52,15 +53,15 @@ class SemanticViT(nn.Module):
         # Patch embedder
         self.patch_embedder = PatchEmbedder(patch_size=patch_size)
 
-        # Qwen decoder (frozen, not nn.Module — created before projector to read hidden_size)
-        self.decoder = QwenDecoder(device=DEVICE)
-        qwen_dim = self.decoder.hidden_size
+        # Decoder (frozen, not nn.Module — created before projector to read hidden_size)
+        self.decoder = create_decoder(decoder_name, device=DEVICE)
+        dec_dim = self.decoder.hidden_size
 
         # Projector (TRAINABLE)
         self.projector = Projector(
             in_dim=patch_size * 768,
             bottleneck_dim=bottleneck_dim,
-            out_dim=qwen_dim,
+            out_dim=dec_dim,
             dropout=dropout,
         ).to(DEVICE)
 

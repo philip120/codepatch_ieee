@@ -29,4 +29,4 @@ from shared.codebert_encoder import CodeBERTEncoder
 from shared.pixel_embedder import PixelEmbedder
 from shared.patch_embedder import PatchEmbedder
 from shared.projector import Projector
-from shared.qwen_decoder import QwenDecoder
+from shared.decoder_factory import create_decoder

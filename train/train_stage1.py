@@ -27,7 +27,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from train.matlab_dataset import MatlabPseudocodeDataset
-from shared.qwen_decoder import QwenDecoder
+from shared.decoder_factory import create_decoder
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -49,14 +49,15 @@ def train(
     save_dir: str = "checkpoints_stage1",
     split: str = "train",
     resume: str = None,
-    model_name: str = "Qwen/Qwen3-4B-Instruct-2507",
+    decoder_name: str = "qwen",
     unfreeze_layers: int = 0,
 ):
     """Stage 1 training: text-only decoder fine-tuning."""
     print("=" * 60)
-    print("STAGE 1 TRAINING: Qwen text-only MATLAB→pseudocode")
+    print(f"STAGE 1 TRAINING: {decoder_name.upper()} text-only MATLAB→pseudocode")
     print("=" * 60)
     print(f"Device: {DEVICE}")
+    print(f"Decoder: {decoder_name}")
     print(f"Epochs: {epochs}")
     print(f"Learning rate: {lr}")
     print(f"Weight decay: {weight_decay}")
@@ -89,8 +90,8 @@ def train(
 
     # Load decoder
     print("\n" + "=" * 60)
-    print("Loading Qwen decoder...")
-    decoder = QwenDecoder(model_name=model_name, device=DEVICE)
+    print(f"Loading {decoder_name} decoder...")
+    decoder = create_decoder(decoder_name, device=DEVICE)
 
     if unfreeze_layers > 0:
         decoder.unfreeze_layers(unfreeze_layers)
@@ -220,6 +221,7 @@ def train(
                         'stage': 1,
                         'step': global_step,
                         'epoch': epoch,
+                        'decoder_name': decoder_name,
                         'lora_state': decoder.get_lora_state_dict(),
                         'qwen_state': {} if unfreeze_layers > 0 else {},
                         'scheduler': scheduler.state_dict(),
@@ -234,11 +236,11 @@ def train(
 
         if avg_epoch_loss < best_loss:
             best_loss = avg_epoch_loss
-            # Full checkpoint: include qwen_state, skip optimizer (17GB for 2.2B params)
             checkpoint = {
                 'stage': 1,
                 'step': global_step,
                 'epoch': epoch,
+                'decoder_name': decoder_name,
                 'lora_state': decoder.get_lora_state_dict(),
                 'qwen_state': decoder.get_unfrozen_state_dict() if unfreeze_layers > 0 else {},
                 'scheduler': scheduler.state_dict(),
@@ -248,11 +250,12 @@ def train(
             torch.save(checkpoint, save_path / "best_model.pt")
             print(f"  New best model! Loss: {best_loss:.4f}")
 
-    # Save final LoRA weights
+    # Save final weights
     final_checkpoint = {
         'stage': 1,
         'step': global_step,
         'epoch': epochs - 1,
+        'decoder_name': decoder_name,
         'lora_state': decoder.get_lora_state_dict(),
         'qwen_state': decoder.get_unfrozen_state_dict() if unfreeze_layers > 0 else {},
         'best_loss': best_loss,
@@ -299,7 +302,7 @@ def train(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Stage 1: Fine-tune Qwen on plain text MATLAB→pseudocode"
+        description="Stage 1: Fine-tune decoder on plain text MATLAB→pseudocode"
     )
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=2e-4)
@@ -314,9 +317,11 @@ if __name__ == "__main__":
     parser.add_argument("--save_dir", type=str, default="checkpoints_stage1")
     parser.add_argument("--split", type=str, default="train")
     parser.add_argument("--resume", type=str, default=None)
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-4B-Instruct-2507")
+    parser.add_argument("--decoder", type=str, default="qwen",
+                        choices=["gemma", "qwen"],
+                        help="Decoder model: gemma or qwen")
     parser.add_argument("--unfreeze_layers", type=int, default=0,
-                        help="Unfreeze last N Qwen layers fully (replaces LoRA). 18 recommended for A100 40GB.")
+                        help="Unfreeze last N decoder layers fully (replaces LoRA)")
 
     args = parser.parse_args()
 
@@ -334,6 +339,6 @@ if __name__ == "__main__":
         save_dir=args.save_dir,
         split=args.split,
         resume=args.resume,
-        model_name=args.model_name,
+        decoder_name=args.decoder,
         unfreeze_layers=args.unfreeze_layers,
     )

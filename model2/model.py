@@ -12,7 +12,7 @@ from .semantic_extractor import SemanticExtractorV2
 from shared.codebert_encoder import CodeBERTEncoder
 from shared.pixel_embedder import PixelEmbedder
 from shared.semantic_extractor import MAX_DEPTH, NUM_TYPES
-from shared.qwen_decoder import QwenDecoder
+from shared.decoder_factory import create_decoder
 from .recursive_encoder import RecursiveEncoder
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -31,6 +31,7 @@ class StructuralModel(nn.Module):
     def __init__(
         self,
         dropout: float = 0.4,
+        decoder_name: str = "qwen",
     ):
         super().__init__()
 
@@ -47,19 +48,19 @@ class StructuralModel(nn.Module):
         ).to(DEVICE)
 
         # Decoder (created first so we can read hidden_size)
-        self.decoder = QwenDecoder(device=DEVICE)
-        qwen_dim = self.decoder.hidden_size
+        self.decoder = create_decoder(decoder_name, device=DEVICE)
+        dec_dim = self.decoder.hidden_size
 
         # Adapt pixel (768) to Recursive dim
-        # No LayerNorm: would pin output norm to sqrt(qwen_dim)≈50,
-        # causing the global_vector to dominate Qwen's residual stream.
-        self.pixel_adapter = nn.Linear(768, qwen_dim).to(DEVICE)
+        # No LayerNorm: would pin output norm to sqrt(dec_dim),
+        # causing the global_vector to dominate the decoder's residual stream.
+        self.pixel_adapter = nn.Linear(768, dec_dim).to(DEVICE)
 
         # Recursive Encoder (tree aggregation)
         self.recursive_encoder = RecursiveEncoder(
-            embed_dim=qwen_dim,
+            embed_dim=dec_dim,
             max_branching=8,
-            hidden_dim=qwen_dim * 2,
+            hidden_dim=dec_dim * 2,
             dropout=dropout
         ).to(DEVICE)
 
