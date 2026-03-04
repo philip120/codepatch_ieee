@@ -60,8 +60,14 @@ def create_model(model_type: str, patch_size: int, bottleneck_dim: int, dropout:
             dropout=dropout,
             decoder_name=decoder_name,
         )
+    elif model_type == "tree_text":
+        from tree_text_model.model import TreeTextModel
+        return TreeTextModel(
+            dropout=dropout,
+            decoder_name=decoder_name,
+        )
     else:
-        raise ValueError(f"Unknown model type: {model_type}. Use 'vit', 'tree', or 'combined'.")
+        raise ValueError(f"Unknown model type: {model_type}. Use 'vit', 'tree', 'combined', or 'tree_text'.")
 
 
 # ==============================================================================
@@ -538,7 +544,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Semantic ViT")
 
     parser.add_argument("--model", type=str, default="combined",
-                        choices=["vit", "tree", "combined"],
+                        choices=["vit", "tree", "combined", "tree_text"],
                         help="Model type: vit, tree, or combined")
     parser.add_argument("--split", type=str, default="train",
                         help="Dataset split (train/test)")

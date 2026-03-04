@@ -59,6 +59,9 @@ def load_model(checkpoint_path: str, lora_rank: int, lora_alpha: int,
     elif model_type == "tree":
         from model2.model import StructuralModel
         model = StructuralModel(dropout=dropout, decoder_name=decoder_name)
+    elif model_type == "tree_text":
+        from tree_text_model.model import TreeTextModel
+        model = TreeTextModel(dropout=dropout, decoder_name=decoder_name)
     else:
         from combined_model.model import CombinedSemanticViT
         model = CombinedSemanticViT(patch_size=patch_size, bottleneck_dim=bottleneck_dim,

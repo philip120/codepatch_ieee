@@ -40,7 +40,7 @@ if __name__ == "__main__":
     parser.add_argument("--s2_grad_accum", type=int, default=8)
     parser.add_argument("--s2_save_dir", type=str, default="checkpoints_stage2")
     parser.add_argument("--s2_model", type=str, default="combined",
-                        choices=["vit", "tree", "combined"])
+                        choices=["vit", "tree", "combined", "tree_text"])
     parser.add_argument("--bottleneck", type=int, default=768)
     parser.add_argument("--dropout", type=float, default=0.05)
 
