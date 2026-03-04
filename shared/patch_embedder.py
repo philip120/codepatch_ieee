@@ -52,10 +52,10 @@ class PatchEmbedder(nn.Module):
 
         # Reshape into patches: [N, D] → [num_patches, P, D]
         num_patches = N // P
-        patches = pixel_embeddings.view(num_patches, P, D)
+        patches = pixel_embeddings.reshape(num_patches, P, D)
 
         # Flatten each patch: [num_patches, P, D] → [num_patches, P*D]
-        flat_patches = patches.view(num_patches, P * D)
+        flat_patches = patches.reshape(num_patches, P * D)
 
         return flat_patches
 
