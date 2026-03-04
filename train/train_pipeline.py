@@ -123,7 +123,7 @@ def train(
     # Load dataset
     print("\n" + "=" * 60)
     print("Loading dataset from Hugging Face...")
-    dataset = MatlabPseudocodeDataset(split=split, model_type=model_type)
+    dataset = MatlabPseudocodeDataset(split=split + "[:80%]", model_type=model_type)
     loader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=lambda x: x[0])
 
     if len(dataset) == 0:
@@ -400,7 +400,7 @@ def train(
     print("=" * 60)
 
     model.eval()
-    test_dataset = MatlabPseudocodeDataset(split="train[-20%:]", model_type=model_type)
+    test_dataset = MatlabPseudocodeDataset(split=split + "[80%:]", model_type=model_type)
     smoother = SmoothingFunction().method1
     bleu_scores = []
     efficiency_metrics = []

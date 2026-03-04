@@ -2,7 +2,7 @@
 Structural Model (Model 2) - Tree-only pipeline
 
 Structural path only:
-    Code -> SemanticExtractorV2 -> CodeBERT -> PixelEmbedder -> PixelAdapter -> RecursiveEncoder -> QwenDecoder
+    Code -> SemanticExtractorV2 -> CodeBERT -> PixelAdapter -> RecursiveEncoder -> Decoder
 """
 import time
 import torch
@@ -10,8 +10,6 @@ import torch.nn as nn
 
 from .semantic_extractor import SemanticExtractorV2
 from shared.codebert_encoder import CodeBERTEncoder
-from shared.pixel_embedder import PixelEmbedder
-from shared.semantic_extractor import MAX_DEPTH, NUM_TYPES
 from shared.decoder_factory import create_decoder
 from .recursive_encoder import RecursiveEncoder
 
@@ -24,7 +22,7 @@ class StructuralModel(nn.Module):
 
     Uses recursive tree encoding of the AST to produce a global vector.
 
-    Trainable: PixelEmbedder, PixelAdapter, RecursiveEncoder
+    Trainable: PixelAdapter, RecursiveEncoder
     Frozen: CodeBERTEncoder, QwenDecoder
     """
 
@@ -40,12 +38,6 @@ class StructuralModel(nn.Module):
 
         # Base Encoder (frozen)
         self.encoder = CodeBERTEncoder(device=DEVICE)
-
-        # Pixel Embedder (trainable)
-        self.pixel_embedder = PixelEmbedder(
-            max_depth=MAX_DEPTH,
-            num_types=NUM_TYPES
-        ).to(DEVICE)
 
         # Decoder (created first so we can read hidden_size)
         self.decoder = create_decoder(decoder_name, device=DEVICE)
@@ -67,7 +59,6 @@ class StructuralModel(nn.Module):
     def get_trainable_parameters(self):
         """Return only trainable parameters for optimizer."""
         params = []
-        params.extend(self.pixel_embedder.parameters())
         params.extend(self.pixel_adapter.parameters())
         params.extend(self.recursive_encoder.parameters())
         params.extend(self.decoder.get_lora_parameters())
@@ -101,17 +92,11 @@ class StructuralModel(nn.Module):
                 return torch.tensor(0.0, device=DEVICE, requires_grad=True)
             return None
 
-        # 2. Base Embeddings [N, 768]
+        # 2. CodeBERT embeddings [N, 768]
         cls_embeddings = self.encoder(features['texts'])
 
-        depth_ids = torch.tensor(features['depths'], device=DEVICE)
-        type_ids = torch.tensor(features['type_ids'], device=DEVICE)
-
-        # 3. Pixel Embeddings [N, 768]
-        pixel_embeddings = self.pixel_embedder(cls_embeddings, depth_ids, type_ids)
-
-        # 4. Adapt for tree: [N, 768] -> [1, N, qwen_dim]
-        pixels_for_tree = self.pixel_adapter(pixel_embeddings).unsqueeze(0)
+        # 3. Adapt for tree: [N, 768] -> [1, N, dec_dim]
+        pixels_for_tree = self.pixel_adapter(cls_embeddings).unsqueeze(0)
 
         # 5. Recursive tree traversal -> [1, qwen_dim]
         global_vector = self.recursive_encoder.forward_tree(

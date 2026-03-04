@@ -3,15 +3,14 @@
 Semantic ViT (Model 1) - ViT-only pipeline
 
 Sequential path only:
-    Code -> SemanticExtractor -> CodeBERT -> PixelEmbedder -> PatchEmbedder -> Projector -> QwenDecoder
+    Code -> SemanticExtractor -> CodeBERT -> PatchEmbedder -> Projector -> Decoder
 """
 import time
 import torch
 import torch.nn as nn
 
-from shared.semantic_extractor import SemanticExtractor, MAX_DEPTH, NUM_TYPES
+from shared.semantic_extractor import SemanticExtractor
 from shared.codebert_encoder import CodeBERTEncoder
-from shared.pixel_embedder import PixelEmbedder
 from shared.patch_embedder import PatchEmbedder
 from shared.projector import Projector
 from shared.decoder_factory import create_decoder
@@ -23,7 +22,7 @@ class SemanticViT(nn.Module):
     """
     ViT-only model for code-to-pseudocode.
 
-    Trainable: PixelEmbedder, Projector
+    Trainable: Projector
     Frozen: CodeBERTEncoder, QwenDecoder
     """
 
@@ -44,12 +43,6 @@ class SemanticViT(nn.Module):
         # CodeBERT (frozen, not nn.Module)
         self.encoder = CodeBERTEncoder(device=DEVICE)
 
-        # Pixel embedder (TRAINABLE)
-        self.pixel_embedder = PixelEmbedder(
-            max_depth=MAX_DEPTH,
-            num_types=NUM_TYPES,
-        ).to(DEVICE)
-
         # Patch embedder
         self.patch_embedder = PatchEmbedder(patch_size=patch_size)
 
@@ -68,7 +61,6 @@ class SemanticViT(nn.Module):
     def get_trainable_parameters(self):
         """Return only trainable parameters for optimizer."""
         params = []
-        params.extend(self.pixel_embedder.parameters())
         params.extend(self.projector.parameters())
         params.extend(self.decoder.get_lora_parameters())
         return params
@@ -104,13 +96,8 @@ class SemanticViT(nn.Module):
         # 2. CodeBERT embeddings [N, 768]
         cls_embeddings = self.encoder(features['texts'])
 
-        # 3. Pixel embeddings [N, 768]
-        depth_ids = torch.tensor(features['depths'], device=DEVICE)
-        type_ids = torch.tensor(features['type_ids'], device=DEVICE)
-        pixel_embeddings = self.pixel_embedder(cls_embeddings, depth_ids, type_ids)
-
-        # 4. Patch embeddings [M, 3072]
-        patch_embeddings = self.patch_embedder(pixel_embeddings)
+        # 3. Patch embeddings [M, patch*768]
+        patch_embeddings = self.patch_embedder(cls_embeddings)
 
         # 5. Project to Qwen space [M, qwen_dim]
         projected = self.projector(patch_embeddings)

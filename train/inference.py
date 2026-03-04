@@ -173,7 +173,7 @@ if __name__ == "__main__":
                         help="Path to a .m file")
     parser.add_argument("--eval", action="store_true",
                         help="Evaluate on dataset samples")
-    parser.add_argument("--split", type=str, default="train[-20%:]",
+    parser.add_argument("--split", type=str, default="train[80%:]",
                         help="Dataset split for --eval")
     parser.add_argument("--num_samples", type=int, default=10)
     parser.add_argument("--max_tokens", type=int, default=128)
