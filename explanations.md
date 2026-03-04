@@ -1168,3 +1168,94 @@ The unfreeze branch of the optimizer setup contained:
 The projector no longer uses `F.normalize` (removed in section 19.8). The comment was stale and misleading. The `weight_decay=0.0` for encoder params may or may not still be optimal — it was originally set to fix a bug that no longer exists — but the comment incorrectly implied the fix was still needed for a current reason.
 
 Fix: removed the stale comment.
+
+---
+
+## 19.10. Changes for Current Training Run
+
+### 19.10.1. Data Leakage Fix
+
+The training pipeline had overlapping train/eval splits:
+
+```python
+# BEFORE (leaky)
+dataset     = MatlabPseudocodeDataset(split="train")        # 100% of training data
+test_dataset = MatlabPseudocodeDataset(split="train[-20%:]") # last 20% of training data
+```
+
+The evaluation set was a subset of the training set — the model was being evaluated on data it had already trained on. This inflated BLEU scores and made them unreliable as a measure of generalization.
+
+```python
+# AFTER (fixed)
+dataset     = MatlabPseudocodeDataset(split=split + "[:80%]") # first 80%
+test_dataset = MatlabPseudocodeDataset(split=split + "[80%:]") # last 20%, held out
+```
+
+HuggingFace dataset slicing is deterministic, so the split boundary is stable across runs.
+
+### 19.10.2. Removal of Depth and Type Embeddings (PixelEmbedder)
+
+The `PixelEmbedder` module added two learned embedding tables on top of the CodeBERT CLS vectors:
+
+```python
+# BEFORE
+pixel_embedding = CLS + depth_embedding(depth_id) + type_embedding(type_id)
+```
+
+This was removed entirely. CLS embeddings from CodeBERT now flow directly into the downstream modules (PatchEmbedder for the ViT path, PixelAdapter for the tree path).
+
+**Why this is likely better:**
+
+1. **Redundant with CodeBERT.** CodeBERT already encodes the text of each semantic node — which implicitly carries type information. A `for` loop's text looks nothing like an `if` statement's text; CodeBERT's CLS vector already captures this distinction. The type embedding was re-encoding information that was already present.
+
+2. **Depth is structural, not semantic.** The depth of a node in the AST is a property of the tree structure, not of the node's content. The tree path (RecursiveEncoder) already captures structural relationships through recursive aggregation — it knows which nodes are nested inside which. Adding depth as an additive bias to the CLS vector conflates structural position with semantic content.
+
+3. **Small embeddings added to large vectors.** The depth and type embeddings were initialized with `std=0.02`, giving them norms of ~0.5-1.0. CodeBERT CLS vectors have norms of ~8-12. The embeddings contributed <10% of the signal and the model had to learn to either amplify them (fighting the CLS dominance) or ignore them (wasting parameters).
+
+4. **Fewer trainable parameters.** Removing the two embedding tables (`16 × 768 + 16 × 768 = 24,576` parameters) simplifies the model. While the parameter count is small, removing them eliminates a source of noise during early training when gradients are large.
+
+5. **Matches the working prototype.** The `codepatch-paligemma` prototype, which successfully trained, did not use depth or type embeddings. It projected image patch features directly into the decoder space without auxiliary embeddings.
+
+**Pipeline after removal:**
+
+```
+MATLAB Code
+    │
+    ▼ SemanticExtractor
+  [texts]
+    │
+    ▼ CodeBERTEncoder (frozen)
+  CLS embeddings [N, 768]
+    │
+    ├── PatchEmbedder → Projector → [M, dec_dim]   (ViT path)
+    └── PixelAdapter  → RecursiveEncoder → [1, dec_dim]  (Tree path)
+    │
+    ▼ cat → [M+1, dec_dim]
+    │
+    ▼ Decoder
+  output text
+```
+
+### 19.10.3. Gemma-2B Decoder Option
+
+Added `google/gemma-2b` as a swappable decoder alongside Qwen3-4B via a `--decoder gemma|qwen` flag. A factory pattern (`shared/decoder_factory.py`) maps the name to the corresponding decoder class.
+
+Key differences between the two decoders:
+
+| Property | Qwen3-4B | Gemma-2B |
+|---|---|---|
+| Hidden size | 2560 | 2048 |
+| Layers | 36 | 18 |
+| Parameters | ~3.5B | ~2B |
+| Default LoRA layers | 6 | 4 |
+| Default unfreeze layers | 18 | 9 |
+
+All downstream dimensions (projector output, pixel_adapter output, recursive_encoder) derive from `decoder.hidden_size`, so switching decoders cascades automatically with no manual dimension changes.
+
+**Why Gemma may help:**
+
+- Smaller model = less VRAM, faster iteration, less risk of the decoder overpowering the encoder signal.
+- The working `codepatch-paligemma` prototype used Gemma successfully.
+- Gemma internally scales `inputs_embeds` by `sqrt(hidden_size)` (~45×), which amplifies the encoder's projected vectors. The projector learns to compensate, but this built-in scaling may help the model attend to encoder tokens more readily.
+
+**Note:** `google/gemma-2b` is a gated model on HuggingFace. Access requires authentication via `huggingface-cli login` or setting the `HF_TOKEN` environment variable.

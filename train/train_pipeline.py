@@ -171,7 +171,7 @@ def train(
         base_params = [p for p in model.get_trainable_parameters() if id(p) not in lora_ids]
         lora_params = list(model.decoder.get_lora_parameters())
         optimizer = torch.optim.AdamW([
-            {'params': base_params, 'lr': lr, 'weight_decay': 0.0},
+            {'params': base_params, 'lr': lr, 'weight_decay': weight_decay},
             {'params': lora_params, 'lr': lora_lr, 'weight_decay': weight_decay},
         ])
         print(f"\nParam groups: encoder ({len(base_params)} tensors, lr={lr}) "
@@ -180,7 +180,7 @@ def train(
         encoder_params = model.get_trainable_parameters()
         qwen_params = model.decoder.get_unfrozen_parameters()
         optimizer = torch.optim.AdamW([
-            {'params': encoder_params, 'lr': lr, 'weight_decay': 0.0},
+            {'params': encoder_params, 'lr': lr, 'weight_decay': weight_decay},
             {'params': qwen_params, 'lr': qwen_lr, 'weight_decay': weight_decay},
         ])
         print(f"\nParam groups: encoder ({len(encoder_params)} tensors, lr={lr}) "
