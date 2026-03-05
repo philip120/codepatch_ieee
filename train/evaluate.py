@@ -49,13 +49,15 @@ def load_stage2_model(checkpoint_path, lora_rank, lora_alpha, lora_dropout,
 
     # Infer patch_size and bottleneck_dim from saved projector weights if present
     if "model_state" in ckpt:
+        print(f"Checkpoint model_state keys: {list(ckpt['model_state'].keys())}")
         for name, data in ckpt["model_state"].items():
-            if name == "projector.net.0.weight":
-                # Projector input is patch_size * 768, so: in_dim / 768 = patch_size
+            if "projector" in name and "weight" in name and data.dim() == 2:
+                # First projector weight: input is patch_size * 768
                 in_dim = data.shape[1]
-                patch_size = in_dim // 768
-                bottleneck_dim = data.shape[0]
-                print(f"Inferred from checkpoint: patch_size={patch_size}, bottleneck_dim={bottleneck_dim}")
+                if in_dim % 768 == 0:
+                    patch_size = in_dim // 768
+                    bottleneck_dim = data.shape[0]
+                    print(f"Inferred from '{name}': patch_size={patch_size}, bottleneck_dim={bottleneck_dim}")
                 break
 
     if model_type == "vit":
@@ -77,11 +79,19 @@ def load_stage2_model(checkpoint_path, lora_rank, lora_alpha, lora_dropout,
     if "model_state" in ckpt:
         model_params = dict(model.named_parameters())
         loaded = 0
+        skipped = []
         for name, data in ckpt["model_state"].items():
             if name in model_params:
+                if model_params[name].shape != data.shape:
+                    skipped.append(f"{name}: model={model_params[name].shape} ckpt={data.shape}")
+                    continue
                 model_params[name].data.copy_(data)
                 loaded += 1
         print(f"Restored {loaded} encoder parameter tensors")
+        if skipped:
+            print(f"WARNING: Skipped {len(skipped)} shape-mismatched tensors:")
+            for s in skipped:
+                print(f"  {s}")
 
     # Restore LoRA or unfrozen decoder weights
     if "qwen_state" in ckpt and ckpt["qwen_state"]:
