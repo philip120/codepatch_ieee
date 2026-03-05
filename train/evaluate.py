@@ -31,7 +31,10 @@ from datasets import load_dataset
 from rouge_score import rouge_scorer
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 
-from shared.decoder_factory import create_decoder
+# Import decoder factory directly to avoid shared/__init__.py pulling in ANTLR
+import importlib
+_decoder_factory = importlib.import_module("shared.decoder_factory")
+create_decoder = _decoder_factory.create_decoder
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -43,6 +46,17 @@ def load_stage2_model(checkpoint_path, lora_rank, lora_alpha, lora_dropout,
     ckpt = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
     model_type = ckpt.get("model_type", "combined")
     decoder_name = decoder_name or ckpt.get("decoder_name", "qwen")
+
+    # Infer patch_size and bottleneck_dim from saved projector weights if present
+    if "model_state" in ckpt:
+        for name, data in ckpt["model_state"].items():
+            if name == "projector.net.0.weight":
+                # Projector input is patch_size * 768, so: in_dim / 768 = patch_size
+                in_dim = data.shape[1]
+                patch_size = in_dim // 768
+                bottleneck_dim = data.shape[0]
+                print(f"Inferred from checkpoint: patch_size={patch_size}, bottleneck_dim={bottleneck_dim}")
+                break
 
     if model_type == "vit":
         from model.model import SemanticViT
