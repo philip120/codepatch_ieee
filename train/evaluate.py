@@ -142,12 +142,20 @@ def load_stage1_decoder(checkpoint_path, lora_rank, lora_alpha, lora_dropout,
 
 @torch.no_grad()
 def generate_stage1(decoder, code: str, max_new_tokens: int = 128):
-    """Generate pseudocode using Stage 1 decoder (text-only, no encoder)."""
+    """Generate pseudocode using Stage 1 decoder (text-only, no encoder).
+    Returns (text, efficiency_metrics)."""
     prompt = f"Convert the following MATLAB code to pseudocode:\n{code}\nPseudocode:"
     tokens = decoder.tokenizer(
         prompt, return_tensors="pt", truncation=True, max_length=512
     ).to(decoder.device)
 
+    num_input_tokens = tokens.input_ids.shape[1]
+
+    if decoder.device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+
+    t0 = time.perf_counter()
     output_ids = decoder.model.generate(
         input_ids=tokens.input_ids,
         attention_mask=tokens.attention_mask,
@@ -156,9 +164,39 @@ def generate_stage1(decoder, code: str, max_new_tokens: int = 128):
         temperature=0.7,
         top_p=0.9,
     )
+    if decoder.device == "cuda":
+        torch.cuda.synchronize()
+    t1 = time.perf_counter()
+
     # Decode only the new tokens
-    new_tokens = output_ids[0, tokens.input_ids.shape[1]:]
-    return decoder.tokenizer.decode(new_tokens, skip_special_tokens=True)
+    new_tokens = output_ids[0, num_input_tokens:]
+    text = decoder.tokenizer.decode(new_tokens, skip_special_tokens=True)
+    num_generated = len(new_tokens)
+
+    # KV cache size: 2 (K+V) × layers × kv_heads × head_dim × seq_len × 2 bytes
+    config = decoder.model.config
+    num_layers = config.num_hidden_layers
+    num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
+    head_dim = config.hidden_size // config.num_attention_heads
+    total_seq_len = num_input_tokens + num_generated
+    kv_cache_bytes = 2 * num_layers * num_kv_heads * head_dim * total_seq_len * 2
+
+    peak_vram_mb = 0.0
+    if decoder.device == "cuda":
+        peak_vram_mb = torch.cuda.max_memory_allocated() / (1024**2)
+
+    gen_time = t1 - t0
+
+    return text, {
+        "encode_time_s": 0.0,  # no encoder
+        "generate_time_s": round(gen_time, 4),
+        "total_time_s": round(gen_time, 4),
+        "num_input_tokens": num_input_tokens,
+        "num_generated_tokens": num_generated,
+        "tokens_per_sec": round(num_generated / gen_time, 1) if gen_time > 0 else 0,
+        "kv_cache_mb": round(kv_cache_bytes / (1024**2), 2),
+        "peak_vram_mb": round(peak_vram_mb, 1),
+    }
 
 
 def main():
@@ -225,16 +263,14 @@ def main():
         if code.lstrip().startswith("classdef"):
             continue
 
-        t0 = time.perf_counter()
         try:
             if args.model_type == "stage1":
-                generated = generate_stage1(decoder, code, args.max_tokens)
+                generated, eff_metrics = generate_stage1(decoder, code, args.max_tokens)
             else:
-                generated = model.generate(code, max_new_tokens=args.max_tokens)
+                generated, eff_metrics = model.generate_with_metrics(code, max_new_tokens=args.max_tokens)
         except Exception as e:
             print(f"  [{i}] generation failed: {e}")
             continue
-        gen_time = time.perf_counter() - t0
 
         # ROUGE
         scores = scorer.score(reference, generated)
@@ -254,31 +290,48 @@ def main():
                 "rouge2": scores['rouge2'].fmeasure,
                 "rougeL": scores['rougeL'].fmeasure,
                 "bleu": bleu,
-                "generation_time_s": round(gen_time, 3),
-            }
+            },
+            "efficiency": eff_metrics,
         })
 
         if i < 5:
-            print(f"\n  [{i}] ROUGE-L={scores['rougeL'].fmeasure:.4f}  BLEU={bleu:.4f}  time={gen_time:.2f}s")
+            print(f"\n  [{i}] ROUGE-L={scores['rougeL'].fmeasure:.4f}  BLEU={bleu:.4f}")
+            print(f"    time={eff_metrics.get('total_time_s', 0):.2f}s  "
+                  f"input_tok={eff_metrics.get('num_input_tokens', 0)}  "
+                  f"gen_tok={eff_metrics.get('num_generated_tokens', 0)}  "
+                  f"kv_cache={eff_metrics.get('kv_cache_mb', 0):.1f}MB")
             print(f"    ref: {reference[:100]}...")
             print(f"    gen: {generated[:100]}...")
 
     # Summary
     if results:
-        avg_r1 = sum(r["metrics"]["rouge1"] for r in results) / len(results)
-        avg_r2 = sum(r["metrics"]["rouge2"] for r in results) / len(results)
-        avg_rl = sum(r["metrics"]["rougeL"] for r in results) / len(results)
-        avg_bleu = sum(r["metrics"]["bleu"] for r in results) / len(results)
-        avg_time = sum(r["metrics"]["generation_time_s"] for r in results) / len(results)
+        n = len(results)
+        avg_r1 = sum(r["metrics"]["rouge1"] for r in results) / n
+        avg_r2 = sum(r["metrics"]["rouge2"] for r in results) / n
+        avg_rl = sum(r["metrics"]["rougeL"] for r in results) / n
+        avg_bleu = sum(r["metrics"]["bleu"] for r in results) / n
+
+        # Efficiency averages
+        def eff_avg(key):
+            vals = [r["efficiency"].get(key, 0) for r in results if "efficiency" in r]
+            return sum(vals) / len(vals) if vals else 0
 
         print(f"\n{'='*60}")
-        print(f"RESULTS: {args.model_type} ({len(results)} samples)")
+        print(f"RESULTS: {args.model_type} ({n} samples)")
         print(f"{'='*60}")
-        print(f"  ROUGE-1:  {avg_r1:.4f}")
-        print(f"  ROUGE-2:  {avg_r2:.4f}")
-        print(f"  ROUGE-L:  {avg_rl:.4f}")
-        print(f"  BLEU:     {avg_bleu:.4f}")
-        print(f"  Avg time: {avg_time:.3f}s")
+        print(f"  ROUGE-1:           {avg_r1:.4f}")
+        print(f"  ROUGE-2:           {avg_r2:.4f}")
+        print(f"  ROUGE-L:           {avg_rl:.4f}")
+        print(f"  BLEU:              {avg_bleu:.4f}")
+        print(f"  --- Efficiency ---")
+        print(f"  Encode time:       {eff_avg('encode_time_s'):.3f}s")
+        print(f"  Generate time:     {eff_avg('generate_time_s'):.3f}s")
+        print(f"  Total time:        {eff_avg('total_time_s'):.3f}s")
+        print(f"  Input tokens:      {eff_avg('num_input_tokens'):.0f}")
+        print(f"  Generated tokens:  {eff_avg('num_generated_tokens'):.0f}")
+        print(f"  Tokens/sec:        {eff_avg('tokens_per_sec'):.1f}")
+        print(f"  KV cache:          {eff_avg('kv_cache_mb'):.2f} MB")
+        print(f"  Peak VRAM:         {eff_avg('peak_vram_mb'):.0f} MB")
 
     # Save
     with open(output_path, "w") as f:
