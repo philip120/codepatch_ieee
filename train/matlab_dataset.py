@@ -15,7 +15,7 @@ class MatlabPseudocodeDataset(Dataset):
         raw_data = load_matlab_nl_dataset(split)
 
         self.data = []
-        if model_type in ("combined", "tree"):
+        if model_type in ("combined", "tree", "tree_text"):
             from model2.semantic_extractor import SemanticExtractorV2
             extractor = SemanticExtractorV2()
         else:

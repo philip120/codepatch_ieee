@@ -1,11 +1,13 @@
 import torch
 import argparse
+import types
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 from modeling_codepatch import CodePatchConfig, CodeEncoderConfig, CodePatchForConditionalGeneration
 from processing_codepatch import CodePatchProcessor
 from transformers import GemmaForCausalLM, GemmaConfig
+from peft import get_peft_model, LoraConfig, TaskType, PeftModel
 from ast_parser.ast_utils import get_semantic_patches
 
 
@@ -17,6 +19,7 @@ def get_args():
     parser.add_argument("--temperature", type=float, default=0.7, help="Temperature for sampling.")
     parser.add_argument("--top_p", type=float, default=0.9, help="Top-p (nucleus) sampling.")
     parser.add_argument("--repetition_penalty", type=float, default=1.2, help="Penalty for repeating tokens.")
+    parser.add_argument("--lora_path", type=str, default=None, help="Path to saved LoRA adapters directory.")
     parser.add_argument("--debug", action="store_true", help="Enable debug prints for inputs and per-token generation.")
     return parser.parse_args()
 
@@ -58,11 +61,19 @@ def main():
     gemma_model = GemmaForCausalLM.from_pretrained("google/gemma-2b", torch_dtype=torch.bfloat16)
     model.language_model.load_state_dict(gemma_model.state_dict())
 
+    # Load LoRA adapters if provided
+    if args.lora_path:
+        print(f"Loading LoRA adapters from: {args.lora_path}")
+        model.language_model = PeftModel.from_pretrained(
+            model.language_model, args.lora_path
+        )
+        print("LoRA adapters loaded.")
+
     print(f"Loading checkpoint from: {args.checkpoint_path}")
     checkpoint = torch.load(args.checkpoint_path, map_location=device)
     model.multi_modal_projector.load_state_dict(checkpoint['projector_state_dict'])
     model.code_encoder.position_embedding.load_state_dict(checkpoint['pos_embedding_state_dict'])
-    model.eval() # Set model to evaluation mode
+    model.eval()
     print("Checkpoint loaded successfully.")
 
     # --- 3. Prepare Inputs ---
