@@ -24,7 +24,9 @@ def get_args():
     parser = argparse.ArgumentParser(description="Run evaluation with a trained CodePatch model.")
     parser.add_argument("--checkpoint_path", type=str, required=True, help="Path to the projector/embedding checkpoint .pt file.")
     parser.add_argument("--lora_adapter_path", type=str, required=True, help="Path to the trained LoRA adapter directory.")
-    parser.add_argument("--eval_dataset_path", type=str, required=True, help="Path to the evaluation dataset JSON file.")
+    parser.add_argument("--eval_dataset_path", type=str, default=None, help="Path to the evaluation dataset JSON file.")
+    parser.add_argument("--use_hf_dataset", action="store_true", help="Load eval samples from HuggingFace dataset instead of JSON.")
+    parser.add_argument("--num_samples", type=int, default=20, help="Number of samples to evaluate (with --use_hf_dataset).")
     parser.add_argument("--output_path", type=str, required=True, help="Path to save the evaluation results.")
     parser.add_argument("--max_new_tokens", type=int, default=200, help="Maximum number of new tokens to generate.")
     parser.add_argument("--temperature", type=float, default=0.7, help="Temperature for sampling.")
@@ -93,9 +95,16 @@ def main():
     print("Checkpoint loaded successfully.")
 
     # --- 3. Load Evaluation Dataset and Loop ---
-    print(f"Loading evaluation data from: {args.eval_dataset_path}")
-    with open(args.eval_dataset_path, "r") as f:
-        eval_dataset = json.load(f)
+    if args.use_hf_dataset:
+        from datasets import load_dataset
+        print(f"Loading {args.num_samples} eval samples from HuggingFace dataset...")
+        hf_data = load_dataset("philip120/matlab-nl-pseudocode-v2", split="train[-20%:]")
+        eval_dataset = [{"code": row["code"], "description": row["nl"]}
+                        for row in hf_data.select(range(min(args.num_samples, len(hf_data))))]
+    else:
+        print(f"Loading evaluation data from: {args.eval_dataset_path}")
+        with open(args.eval_dataset_path, "r") as f:
+            eval_dataset = json.load(f)
 
     results = []
     scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
