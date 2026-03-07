@@ -207,7 +207,9 @@ def main():
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to checkpoint file")
     parser.add_argument("--num_samples", type=int, default=20)
-    parser.add_argument("--max_tokens", type=int, default=128)
+    parser.add_argument("--max_tokens", type=int, default=512)
+    parser.add_argument("--max_code_chars", type=int, default=None,
+                        help="Skip code samples longer than this (in characters)")
     parser.add_argument("--output_path", type=str, default=None,
                         help="Path to save results JSON (default: eval_<model_type>.json)")
 
@@ -261,6 +263,8 @@ def main():
         if not code or not reference:
             continue
         if code.lstrip().startswith("classdef"):
+            continue
+        if args.max_code_chars and len(code) > args.max_code_chars:
             continue
 
         try:
