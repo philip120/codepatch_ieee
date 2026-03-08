@@ -42,6 +42,7 @@ if __name__ == "__main__":
     parser.add_argument("--s2_model", type=str, default="combined",
                         choices=["vit", "tree", "combined", "tree_text"])
     parser.add_argument("--bottleneck", type=int, default=768)
+    parser.add_argument("--patch_size", type=int, default=1)
     parser.add_argument("--dropout", type=float, default=0.05)
 
     # Decoder adaptation — choose one: unfreeze (recommended) or LoRA
@@ -115,7 +116,7 @@ if __name__ == "__main__":
         epochs=args.s2_epochs,
         lr=args.s2_lr,
         weight_decay=0.05,
-        patch_size=4,
+        patch_size=args.patch_size,
         bottleneck_dim=args.bottleneck,
         dropout=args.dropout,
         log_every=10,

@@ -246,9 +246,22 @@ def main():
         print(f"Detected model type from checkpoint: {detected_type}")
 
     # Load eval data
-    print(f"\nLoading {args.num_samples} eval samples from HuggingFace...")
+    print(f"\nLoading eval samples from HuggingFace...")
     hf_data = load_dataset("philip120/matlab-nl-pseudocode-v2", split="train[-20%:]")
-    eval_samples = list(hf_data.select(range(min(args.num_samples, len(hf_data)))))
+    eval_samples = []
+    for item in hf_data:
+        code = item.get("code", "")
+        nl = item.get("nl", "")
+        if not code or not nl:
+            continue
+        if code.lstrip().startswith("classdef"):
+            continue
+        if args.max_code_chars and len(code) > args.max_code_chars:
+            continue
+        eval_samples.append(item)
+        if len(eval_samples) >= args.num_samples:
+            break
+    print(f"Selected {len(eval_samples)} samples (max_code_chars={args.max_code_chars})")
 
     # Eval
     scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
@@ -261,10 +274,6 @@ def main():
         reference = item["nl"]
 
         if not code or not reference:
-            continue
-        if code.lstrip().startswith("classdef"):
-            continue
-        if args.max_code_chars and len(code) > args.max_code_chars:
             continue
 
         try:
