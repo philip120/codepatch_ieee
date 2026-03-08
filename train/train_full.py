@@ -94,7 +94,7 @@ if __name__ == "__main__":
             lora_dropout=args.lora_dropout,
             lora_layers=args.lora_layers,
             log_every=10,
-            save_every=100,
+            save_every=2000,
             save_dir=args.s1_save_dir,
             split=args.split,
             resume=args.s1_resume,

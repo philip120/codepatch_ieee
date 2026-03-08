@@ -157,17 +157,19 @@ def train(
         print(f"\nLoading Stage 1 weights from: {stage1_checkpoint}")
         s1_ckpt = torch.load(stage1_checkpoint, map_location=DEVICE, weights_only=False)
         if s1_ckpt.get("qwen_state"):
-            if unfreeze_layers == 0:
-                raise ValueError("Stage 1 used unfreeze but Stage 2 does not. Pass --unfreeze_layers.")
-            model.decoder.load_unfrozen_state_dict(s1_ckpt["qwen_state"])
+            # Load Stage 1 decoder weights into the base model regardless
+            # of Stage 2 strategy (LoRA or unfreeze). This ensures the
+            # decoder starts from the fine-tuned state.
+            model.decoder.model.load_state_dict(s1_ckpt["qwen_state"], strict=False)
             print(f"  Loaded {len(s1_ckpt['qwen_state'])} Qwen tensors from Stage 1.")
         elif s1_ckpt.get("lora_state"):
             if not lora:
-                raise ValueError("Stage 1 used LoRA but Stage 2 does not. Pass --lora.")
-            model.decoder.load_lora_state_dict(s1_ckpt["lora_state"])
-            print(f"  Loaded {len(s1_ckpt['lora_state'])} LoRA tensors from Stage 1.")
+                print("  Warning: Stage 1 used LoRA but Stage 2 does not. Skipping LoRA state.")
+            else:
+                model.decoder.load_lora_state_dict(s1_ckpt["lora_state"])
+                print(f"  Loaded {len(s1_ckpt['lora_state'])} LoRA tensors from Stage 1.")
         else:
-            raise ValueError("Stage 1 checkpoint has neither 'qwen_state' nor 'lora_state'.")
+            print("  Warning: Stage 1 checkpoint has no decoder weights to load.")
 
     print(f"\nTrainable parameters: {model.num_trainable_parameters():,}")
 
