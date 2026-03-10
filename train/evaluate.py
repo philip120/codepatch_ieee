@@ -307,14 +307,14 @@ def main():
             "efficiency": eff_metrics,
         })
 
-        if i < 5:
-            print(f"\n  [{i}] ROUGE-L={scores['rougeL'].fmeasure:.4f}  BLEU={bleu:.4f}")
-            print(f"    time={eff_metrics.get('total_time_s', 0):.2f}s  "
-                  f"input_tok={eff_metrics.get('num_input_tokens', 0)}  "
-                  f"gen_tok={eff_metrics.get('num_generated_tokens', 0)}  "
-                  f"kv_cache={eff_metrics.get('kv_cache_mb', 0):.1f}MB")
-            print(f"    ref: {reference[:100]}...")
-            print(f"    gen: {generated[:100]}...")
+        print(f"  [{i}/{len(eval_samples)}] ROUGE-L={scores['rougeL'].fmeasure:.4f}  BLEU={bleu:.4f}  "
+              f"time={eff_metrics.get('total_time_s', 0):.1f}s  "
+              f"gen_tok={eff_metrics.get('num_generated_tokens', 0)}")
+
+        # Save incrementally every 10 samples
+        if len(results) % 10 == 0:
+            with open(output_path, "w") as f:
+                json.dump(results, f, indent=4)
 
     # Summary
     if results:
