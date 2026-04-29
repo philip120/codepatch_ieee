@@ -37,7 +37,7 @@ class RecursiveEncoder(nn.Module):
             nn.Linear(hidden_dim, embed_dim),
         )
 
-        # Combiner: Parent + Child_Summary. No final LayerNorm for same reason.
+        # Combiner: Parent + Child_Summary.
         self.combiner = nn.Linear(embed_dim * 2, embed_dim)
         
     def aggregate_children(self, child_vectors: torch.Tensor, debug: bool = False) -> torch.Tensor:

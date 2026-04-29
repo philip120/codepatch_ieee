@@ -6,7 +6,7 @@ from shared.semantic_extractor import SemanticExtractor
 
 class MatlabPseudocodeDataset(Dataset):
     """
-    Dataset wrapper for Hugging Face philip120/matlab-nl-pseudocode
+    Dataset wrapper for Hugging Face dataset
     Pre-computes semantic features to avoid parsing overhead during training.
     """
 

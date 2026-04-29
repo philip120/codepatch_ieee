@@ -1,150 +1,92 @@
-# CodePatch: Semantic ViT for MATLAB-to-Pseudocode Generation
+# CodePatch
 
-A vision-transformer-inspired architecture for converting MATLAB code to natural language pseudocode.
+Code for "CodePatch: A Comparative Study of ViT-Inspired and Tree-Structural Code Representations for Pseudocode Generation."
 
-## Project Structure
+## Structure
 
 ```
-├── model/                  # Model components (pipeline steps 1-6)
-│   ├── semantic_extractor.py   # Step 1: MATLAB → semantic operations
-│   ├── codebert_encoder.py     # Step 2: CodeBERT embeddings (frozen)
-│   ├── pixel_embedder.py       # Step 3: Depth + type embeddings (trainable)
-│   ├── patch_embedder.py       # Step 4: Group pixels into patches
-│   ├── projector.py            # Step 5: Bottleneck MLP (trainable)
-│   └── qwen_decoder.py         # Step 6: Qwen text generation (frozen)
-│
-├── train/                  # Training and inference scripts
-│   ├── train_pipeline.py       # Main training script
-│   ├── train_with_func.py      # Pipeline testing/debugging
-│   ├── inference.py            # Run inference with trained model
+├── model/                  # Model Variant 2: ViT-only
+├── model2/                 # Model Variant (Tree/RvNN)
+│   ├── recursive_encoder.py    # RvNN (shared by tree variants)
+│   └── semantic_extractor.py   # AST → tree structure
+├── combined_model/         # Model Variant 3: Combined (Tree + ViT)
+├── tree_text_model/        # Model Variant 4: Tree + Text
+├── shared/                 # Shared components
+│   ├── codebert_encoder.py     # CodeBERT (frozen)
+│   ├── qwen_decoder.py         # Qwen3-4B decoder
+│   ├── projector.py            # Linear projector (768 → 2560)
+│   └── patch_embedder.py       # ViT-style patch grouping
+├── train/                  # Training and evaluation
+│   ├── train_full.py           # Two-stage training (main entry)
+│   ├── train_stage1.py         # Stage 1: decoder fine-tuning
+│   ├── train_pipeline.py       # Stage 2: encoder/projector training
+│   ├── evaluate.py             # Unified evaluation (all variants)
+│   ├── inference.py            # Single-sample inference
 │   ├── semantic_adapter.py     # ANTLR-based MATLAB parser
-│   ├── load_dataset.py         # Hugging Face dataset loader
+│   ├── load_dataset.py         # HuggingFace dataset loader
 │   └── matlab_dataset.py       # PyTorch Dataset wrapper
-│
-├── grammars-v4/matlab/     # ANTLR grammar for MATLAB parsing
-│   ├── MATLAB.g4               # Grammar definition
-│   ├── matlabLexer.py          # Compiled lexer (Python)
-│   ├── matlabParser.py         # Compiled parser (Python)
-│   └── ...
-│
-└── checkpoints/            # Saved model checkpoints
+└── grammars-v4/matlab/     # ANTLR4 MATLAB grammar
 ```
 
 ## Setup
-
-### 1. Install Dependencies
 
 ```bash
 pip install -r train/requirements.txt
 ```
 
-### 2. ANTLR Grammar (if recompiling)
+Requires `antlr4-python3-runtime==4.13.1`.
 
-The MATLAB grammar is pre-compiled in `grammars-v4/matlab/`. If you need to recompile:
+## Training
 
-```bash
-# Install ANTLR
-# macOS
-brew install antlr
-
-# Ubuntu
-sudo apt-get install antlr4
-
-# Or download JAR
-wget https://www.antlr.org/download/antlr-4.13.1-complete.jar
-```
-
-Compile the grammar:
-```bash
-cd grammars-v4/matlab
-
-# Using installed antlr
-antlr4 -Dlanguage=Python3 MATLAB.g4
-
-# Or using JAR
-java -jar /path/to/antlr-4.13.1-complete.jar -Dlanguage=Python3 MATLAB.g4
-```
-
-**Important:** The `antlr4-python3-runtime` version must match the ANTLR version used to compile the grammar.
-
-### 3. Google Colab Setup
-
-```python
-# Install dependencies
-!pip install torch transformers datasets antlr4-python3-runtime==4.13.1
-
-# Clone repository
-!git clone https://github.com/philip120/codepatch_ieee.git
-%cd codepatch_ieee
-
-# If grammar needs recompiling
-!apt-get install -y default-jre
-!wget https://www.antlr.org/download/antlr-4.13.1-complete.jar
-!cd grammars-v4/matlab && java -jar /content/antlr-4.13.1-complete.jar -Dlanguage=Python3 MATLAB.g4
-```
-
-## Usage
-
-### Training
+### Full two-stage training (recommended)
 
 ```bash
-python -m train.train_pipeline \
-    --epochs 10 \
-    --lr 1e-4 \
-    --patch_size 4 \
-    --bottleneck 512 \
-    --dropout 0.4
+python -m train.train_full --s2_model tree_text
 ```
 
-### Inference
+Runs Stage 1 (decoder fine-tuning) then Stage 2 (encoder training) back-to-back. Default: 5 Stage 1 epochs, 10 Stage 2 epochs.
+
+### Stage 1 only: Decoder fine-tuning (Text-only baseline)
 
 ```bash
-# Evaluate on dataset
-python -m train.inference --checkpoint checkpoints/best_model.pt --eval --num_samples 10
-
-# Single code snippet
-python -m train.inference --checkpoint checkpoints/best_model.pt --code "function y = f(x); y = x*2; end"
-
-# Interactive mode
-python -m train.inference --checkpoint checkpoints/best_model.pt --interactive
+python -m train.train_stage1 \
+    --epochs 5 --lr 2e-4 --unfreeze_layers 18 \
+    --save_dir checkpoints_stage1
 ```
 
+### Stage 2 only: Encoder/projector training
 
-## Architecture Overview
+Requires an existing Stage 1 checkpoint (`--skip_stage1`):
 
+```bash
+# Tree+Text (best variant)
+python -m train.train_full --skip_stage1 \
+    --stage1_checkpoint checkpoints_stage1/best_model.pt \
+    --s2_model tree_text --s2_epochs 10
+
+# ViT-only
+python -m train.train_full --skip_stage1 \
+    --stage1_checkpoint checkpoints_stage1/best_model.pt \
+    --s2_model vit --s2_epochs 10 --patch_size 1
+
+# Combined (Tree + ViT)
+python -m train.train_full --skip_stage1 \
+    --stage1_checkpoint checkpoints_stage1/best_model.pt \
+    --s2_model combined --s2_epochs 10 --patch_size 1
 ```
-MATLAB Code
-    │
-    ▼ SemanticExtractor (ANTLR parser)
-[semantic operations with depth & type]
-    │
-    ▼ CodeBERTEncoder (frozen)
-[CLS embeddings per operation]
-    │
-    ▼ PixelEmbedder (trainable)
-[CLS + depth_emb + type_emb]
-    │
-    ▼ PatchEmbedder
-[group pixels into patches]
-    │
-    ▼ Projector (trainable, bottleneck MLP)
-[project to Qwen embedding space]
-    │
-    ▼ QwenDecoder (frozen)
-[generate pseudocode]
+
+## Evaluation
+
+```bash
+python -m train.evaluate \
+    --model_type tree_text \
+    --checkpoint checkpoints/tree_text_final.pt \
+    --num_samples 500 --max_tokens 512 \
+    --output_path results/eval_tree_text.json
 ```
+
+Model types: `stage1`, `vit`, `combined`, `tree_text`.
 
 ## Dataset
 
-Uses `philip120/matlab-nl-pseudocode` from Hugging Face.
-
-## Hyperparameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| patch_size | 4 | Pixels per patch |
-| bottleneck | 512 | MLP bottleneck dimension |
-| dropout | 0.4 | Dropout rate |
-| lr | 1e-4 | Learning rate |
-| weight_decay | 0.05 | AdamW weight decay |
-| grad_accum | 4 | Gradient accumulation steps |
+MATLAB → pseudocode pairs. Dataset will be made available upon acceptance.
