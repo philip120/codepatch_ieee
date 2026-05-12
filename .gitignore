@@ -35,3 +35,7 @@ dataset/
 *.csv
 *.json
 textfiles/codepatch_paligemma/
+
+# local excludes
+idk/grammars-v4/
+idk/explanations.md
