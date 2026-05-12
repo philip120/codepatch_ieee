@@ -34,4 +34,4 @@ build/
 dataset/
 *.csv
 *.json
-textfiles/
+textfiles/codepatch_paligemma/
